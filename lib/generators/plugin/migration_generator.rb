@@ -1,12 +1,6 @@
 # frozen_string_literal: true
 
 require "rails/generators/active_record/migration/migration_generator"
-  sdf_category:
-    default: "Uncatedgorized"
-  testcsc_category: "Uncategorized"
-  testcsc_full_editor:
-    client: true
-    default: true
 class Plugin::MigrationGenerator < ActiveRecord::Generators::MigrationGenerator
   desc "Expecting NAME to start with name of plugin: Pluginname_Migrationname"
   source_root "#{Gem.loaded_specs["activerecord"].full_gem_path}/lib/rails/generators/active_record/migration/templates"
