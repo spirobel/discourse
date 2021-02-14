@@ -16,17 +16,12 @@ describe UploadsController do
         sign_in(user)
       end
 
-      let(:logo) do
-        Rack::Test::UploadedFile.new(file_from_fixtures("logo.png"))
-      end
+      let(:logo_file) { file_from_fixtures("logo.png") }
+      let(:logo_filename) { File.basename(logo_file) }
 
-      let(:fake_jpg) do
-        Rack::Test::UploadedFile.new(file_from_fixtures("fake.jpg"))
-      end
-
-      let(:text_file) do
-        Rack::Test::UploadedFile.new(File.new("#{Rails.root}/LICENSE.txt"))
-      end
+      let(:logo) { Rack::Test::UploadedFile.new(logo_file) }
+      let(:fake_jpg) { Rack::Test::UploadedFile.new(file_from_fixtures("fake.jpg")) }
+      let(:text_file) { Rack::Test::UploadedFile.new(File.new("#{Rails.root}/LICENSE.txt")) }
 
       it 'expects a type' do
         post "/uploads.json", params: { file: logo }
@@ -36,8 +31,26 @@ describe UploadsController do
       it 'is successful with an image' do
         post "/uploads.json", params: { file: logo, type: "avatar" }
         expect(response.status).to eq 200
-        expect(JSON.parse(response.body)["id"]).to be_present
+        expect(response.parsed_body["id"]).to be_present
         expect(Jobs::CreateAvatarThumbnails.jobs.size).to eq(1)
+      end
+
+      it 'returns "raw" url for site settings' do
+        set_cdn_url "https://awesome.com"
+
+        upload = UploadCreator.new(logo_file, "logo.png").create_for(-1)
+        logo = Rack::Test::UploadedFile.new(file_from_fixtures("logo.png"))
+
+        post "/uploads.json", params: { file: logo, type: "site_setting", for_site_setting: "true" }
+        expect(response.status).to eq 200
+        expect(response.parsed_body["url"]).to eq(upload.url)
+      end
+
+      it 'returns cdn url' do
+        set_cdn_url "https://awesome.com"
+        post "/uploads.json", params: { file: logo, type: "composer" }
+        expect(response.status).to eq 200
+        expect(response.parsed_body["url"]).to start_with("https://awesome.com/uploads/default/")
       end
 
       it 'is successful with an attachment' do
@@ -47,7 +60,7 @@ describe UploadsController do
         expect(response.status).to eq 200
 
         expect(Jobs::CreateAvatarThumbnails.jobs.size).to eq(0)
-        id = JSON.parse(response.body)["id"]
+        id = response.parsed_body["id"]
         expect(id).to be
       end
 
@@ -60,9 +73,12 @@ describe UploadsController do
 
         stub_request(:get, url).to_return(status: 200, body: png)
 
-        post "/uploads.json", params: { url: url, type: "avatar", api_key: api_key, api_username: user.username }
+        post "/uploads.json", params: { url: url, type: "avatar" }, headers: {
+          HTTP_API_KEY: api_key,
+          HTTP_API_USERNAME: user.username.downcase
+        }
 
-        json = ::JSON.parse(response.body)
+        json = response.parsed_body
 
         expect(response.status).to eq(200)
         expect(Jobs::CreateAvatarThumbnails.jobs.size).to eq(1)
@@ -79,7 +95,7 @@ describe UploadsController do
           type: "profile_background",
         }
 
-        id = JSON.parse(response.body)["id"]
+        id = response.parsed_body["id"]
         expect(Jobs::CreateAvatarThumbnails.jobs.size).to eq(0)
         expect(Upload.find(id).retain_hours).to eq(100)
       end
@@ -88,7 +104,7 @@ describe UploadsController do
         post "/uploads.json", params: { type: "composer" }
 
         expect(Jobs::CreateAvatarThumbnails.jobs.size).to eq(0)
-        message = JSON.parse(response.body)
+        message = response.parsed_body
         expect(response.status).to eq 422
         expect(message["errors"]).to contain_exactly(I18n.t("upload.file_missing"))
       end
@@ -101,7 +117,7 @@ describe UploadsController do
 
         expect(response.status).to eq(422)
         expect(Jobs::CreateAvatarThumbnails.jobs.size).to eq(0)
-        errors = JSON.parse(response.body)["errors"]
+        errors = response.parsed_body["errors"]
         expect(errors.first).to eq(I18n.t("upload.attachments.too_large", max_size_kb: 1))
       end
 
@@ -111,8 +127,8 @@ describe UploadsController do
         expect(response.status).to eq(422)
       end
 
-      it 'ensures sso_overrides_avatar is not enabled when uploading an avatar' do
-        SiteSetting.sso_overrides_avatar = true
+      it 'ensures discourse_connect_overrides_avatar is not enabled when uploading an avatar' do
+        SiteSetting.discourse_connect_overrides_avatar = true
         post "/uploads.json", params: { file: logo, type: "avatar" }
         expect(response.status).to eq(422)
       end
@@ -137,7 +153,7 @@ describe UploadsController do
         }
 
         expect(response.status).to eq(200)
-        id = JSON.parse(response.body)["id"]
+        id = response.parsed_body["id"]
         expect(Upload.last.id).to eq(id)
       end
 
@@ -152,12 +168,12 @@ describe UploadsController do
         }
 
         expect(response.status).to eq(200)
-        id = JSON.parse(response.body)["id"]
+        id = response.parsed_body["id"]
 
         upload = Upload.last
 
         expect(upload.id).to eq(id)
-        expect(upload.original_filename).to eq('logo.png')
+        expect(upload.original_filename).to eq(logo_filename)
       end
 
       it 'respects `authorized_extensions_for_staff` setting when staff upload file' do
@@ -171,7 +187,7 @@ describe UploadsController do
         }
 
         expect(response.status).to eq(200)
-        data = JSON.parse(response.body)
+        data = response.parsed_body
         expect(data["id"]).to be_present
       end
 
@@ -184,7 +200,7 @@ describe UploadsController do
           type: "composer",
         }
 
-        data = JSON.parse(response.body)
+        data = response.parsed_body
         expect(data["errors"].first).to eq(I18n.t("upload.unauthorized", authorized_extensions: ''))
       end
 
@@ -193,7 +209,7 @@ describe UploadsController do
 
         expect(response.status).to eq(422)
         expect(Jobs::CreateAvatarThumbnails.jobs.size).to eq(0)
-        message = JSON.parse(response.body)["errors"]
+        message = response.parsed_body["errors"]
         expect(message).to contain_exactly(I18n.t("upload.images.size_not_found"))
       end
     end
@@ -211,7 +227,7 @@ describe UploadsController do
 
     expect(response.status).to eq(200)
 
-    url = JSON.parse(response.body)["url"]
+    url = response.parsed_body["url"]
     upload = Upload.get_from_url(url)
     upload
   end
@@ -224,9 +240,7 @@ describe UploadsController do
       fab!(:upload) { upload_file("small.pdf", "pdf") }
 
       before do
-        SiteSetting.enable_s3_uploads = true
-        SiteSetting.s3_access_key_id = "fakeid7974664"
-        SiteSetting.s3_secret_access_key = "fakesecretid7974664"
+        setup_s3
       end
 
       it "returns 404 " do
@@ -262,7 +276,7 @@ describe UploadsController do
       expect(response.status).to eq(200)
 
       expect(response.headers["Content-Disposition"])
-        .to eq(%Q|attachment; filename="logo.png"; filename*=UTF-8''logo.png|)
+        .to eq(%Q|attachment; filename="#{upload.original_filename}"; filename*=UTF-8''#{upload.original_filename}|)
     end
 
     it 'returns 200 when js file' do
@@ -279,7 +293,7 @@ describe UploadsController do
       get "/uploads/#{site}/#{upload.sha1}.json"
       expect(response.status).to eq(200)
       expect(response.headers["Content-Disposition"])
-        .to eq(%Q|attachment; filename="image_no_extension.png"; filename*=UTF-8''image_no_extension.png|)
+        .to eq(%Q|attachment; filename="#{upload.original_filename}"; filename*=UTF-8''#{upload.original_filename}|)
     end
 
     it "handles file without extension" do
@@ -289,7 +303,7 @@ describe UploadsController do
       get "/uploads/#{site}/#{upload.sha1}.json"
       expect(response.status).to eq(200)
       expect(response.headers["Content-Disposition"])
-        .to eq(%Q|attachment; filename="not_an_image"; filename*=UTF-8''not_an_image|)
+        .to eq(%Q|attachment; filename="#{upload.original_filename}"; filename*=UTF-8''#{upload.original_filename}|)
     end
 
     context "prevent anons from downloading files" do
@@ -352,7 +366,7 @@ describe UploadsController do
       end
 
       it "returns the right response when anon tries to download a file " \
-         "when prevent_anons_from_downloading_files is true" do
+        "when prevent_anons_from_downloading_files is true" do
 
         delete "/session/#{user.username}.json"
         SiteSetting.prevent_anons_from_downloading_files = true
@@ -367,9 +381,7 @@ describe UploadsController do
       let(:upload) { Fabricate(:upload_s3) }
 
       before do
-        SiteSetting.enable_s3_uploads = true
-        SiteSetting.s3_access_key_id = "fakeid7974664"
-        SiteSetting.s3_secret_access_key = "fakesecretid7974664"
+        setup_s3
       end
 
       it "should redirect to the s3 URL" do
@@ -382,16 +394,36 @@ describe UploadsController do
         before do
           SiteSetting.secure_media = true
           upload.update(secure: true)
-          stub_request(:head, "https://#{SiteSetting.s3_upload_bucket}.s3.amazonaws.com/")
         end
 
         it "redirects to the signed_url_for_path" do
+          sign_in(user)
+          freeze_time
           get upload.short_path
 
           expect(response).to redirect_to(Discourse.store.signed_url_for_path(Discourse.store.get_path_for_upload(upload)))
+          expect(response.header['Location']).not_to include('response-content-disposition=attachment')
+        end
+
+        it "respects the force download (dl) param" do
+          sign_in(user)
+          freeze_time
+          get upload.short_path, params: { dl: '1' }
+          expect(response.header['Location']).to include('response-content-disposition=attachment')
+        end
+
+        it "has the correct caching header" do
+          sign_in(user)
+          get upload.short_path
+
+          expected_max_age = S3Helper::DOWNLOAD_URL_EXPIRES_AFTER_SECONDS - UploadsController::SECURE_REDIRECT_GRACE_SECONDS
+          expect(expected_max_age).to be > 0 # Sanity check that the constants haven't been set to broken values
+
+          expect(response.headers["Cache-Control"]).to eq("max-age=#{expected_max_age}, private")
         end
 
         it "raises invalid access if the user cannot access the upload access control post" do
+          sign_in(user)
           post = Fabricate(:post)
           post.topic.change_category_to_id(Fabricate(:private_category, group: Fabricate(:group)).id)
           upload.update(access_control_post: post)
@@ -430,17 +462,9 @@ describe UploadsController do
       let(:upload) { Fabricate(:upload_s3) }
       let(:secure_url) { upload.url.sub(SiteSetting.Upload.absolute_base_url, "/secure-media-uploads") }
 
-      def sign_in_and_stub_head
-        sign_in(user)
-        stub_request(:head, "https://#{SiteSetting.s3_upload_bucket}.s3.amazonaws.com/")
-      end
-
       before do
-        SiteSetting.enable_s3_uploads = true
-        SiteSetting.s3_upload_bucket = "s3-upload-bucket"
-        SiteSetting.s3_access_key_id = "fakeid7974664"
-        SiteSetting.s3_secret_access_key = "fakesecretid7974664"
-        SiteSetting.s3_region = "us-east-1"
+        setup_s3
+        SiteSetting.authorized_extensions = "*"
         SiteSetting.secure_media = true
       end
 
@@ -450,8 +474,7 @@ describe UploadsController do
       end
 
       it "should return signed url for legitimate request" do
-        sign_in_and_stub_head
-
+        sign_in(user)
         get secure_url
 
         expect(response.status).to eq(302)
@@ -465,13 +488,13 @@ describe UploadsController do
         post "/uploads/lookup-urls.json", params: { short_urls: [upload.short_url] }
         expect(response.status).to eq(200)
 
-        result = JSON.parse(response.body)
+        result = response.parsed_body
         expect(result[0]["url"]).to match("secure-media-uploads")
       end
 
       context "when the upload cannot be found from the URL" do
         it "returns a 404" do
-          sign_in_and_stub_head
+          sign_in(user)
           upload.update(sha1: 'test')
 
           get secure_url
@@ -484,13 +507,13 @@ describe UploadsController do
         let!(:private_category) { Fabricate(:private_category, group: Fabricate(:group)) }
 
         before do
-          sign_in_and_stub_head
+          sign_in(user)
           upload.update(access_control_post_id: post.id)
         end
 
         context "when the user has access to the post via guardian" do
           it "should return signed url for legitimate request" do
-            sign_in_and_stub_head
+            sign_in(user)
             get secure_url
             expect(response.status).to eq(302)
             expect(response.redirect_url).to match("Amz-Expires")
@@ -503,9 +526,49 @@ describe UploadsController do
           end
 
           it "returns a 403" do
-            sign_in_and_stub_head
+            sign_in(user)
             get secure_url
             expect(response.status).to eq(403)
+          end
+        end
+      end
+
+      context "when the upload is an attachment file" do
+        before do
+          upload.update(original_filename: 'test.pdf')
+        end
+        it "redirects to the signed_url_for_path" do
+          sign_in(user)
+          get secure_url
+          expect(response.status).to eq(302)
+          expect(response.redirect_url).to match("Amz-Expires")
+        end
+
+        context "when the user does not have access to the access control post via guardian" do
+          let(:post) { Fabricate(:post) }
+          let!(:private_category) { Fabricate(:private_category, group: Fabricate(:group)) }
+
+          before do
+            post.topic.change_category_to_id(private_category.id)
+            upload.update(access_control_post_id: post.id)
+          end
+
+          it "returns a 403" do
+            sign_in(user)
+            get secure_url
+            expect(response.status).to eq(403)
+          end
+        end
+
+        context "when the prevent_anons_from_downloading_files setting is enabled and the user is anon" do
+          before do
+            SiteSetting.prevent_anons_from_downloading_files = true
+          end
+
+          it "returns a 404" do
+            delete "/session/#{user.username}.json"
+            get secure_url
+            expect(response.status).to eq(404)
           end
         end
       end
@@ -523,8 +586,6 @@ describe UploadsController do
           it "should redirect to the regular show route" do
             secure_url = upload.url.sub(SiteSetting.Upload.absolute_base_url, "/secure-media-uploads")
             sign_in(user)
-            stub_request(:head, "https://#{SiteSetting.s3_upload_bucket}.s3.amazonaws.com/")
-
             get secure_url
 
             expect(response.status).to eq(302)
@@ -540,8 +601,6 @@ describe UploadsController do
           it "should redirect to the presigned URL still otherwise we will get a 403" do
             secure_url = upload.url.sub(SiteSetting.Upload.absolute_base_url, "/secure-media-uploads")
             sign_in(user)
-            stub_request(:head, "https://#{SiteSetting.s3_upload_bucket}.s3.amazonaws.com/")
-
             get secure_url
 
             expect(response.status).to eq(302)
@@ -560,7 +619,7 @@ describe UploadsController do
       post "/uploads/lookup-urls.json", params: { short_urls: [upload.short_url] }
       expect(response.status).to eq(200)
 
-      result = JSON.parse(response.body)
+      result = response.parsed_body
       expect(result[0]["url"]).to eq(upload.url)
       expect(result[0]["short_path"]).to eq(upload.short_path)
     end
@@ -569,11 +628,8 @@ describe UploadsController do
       let(:upload) { Fabricate(:upload_s3, secure: true) }
 
       before do
+        setup_s3
         SiteSetting.authorized_extensions = "pdf|png"
-        SiteSetting.s3_upload_bucket = "s3-upload-bucket"
-        SiteSetting.s3_access_key_id = "s3-access-key-id"
-        SiteSetting.s3_secret_access_key = "s3-secret-access-key"
-        SiteSetting.enable_s3_uploads = true
         SiteSetting.secure_media = true
       end
 
@@ -583,20 +639,20 @@ describe UploadsController do
         post "/uploads/lookup-urls.json", params: { short_urls: [upload.short_url] }
         expect(response.status).to eq(200)
 
-        result = JSON.parse(response.body)
+        result = response.parsed_body
         expect(result[0]["url"]).to match("/secure-media-uploads")
         expect(result[0]["short_path"]).to eq(upload.short_path)
       end
 
-      it 'does not return secure urls for non-media uploads' do
+      it 'returns secure urls for non-media uploads' do
         upload.update!(original_filename: "not-an-image.pdf", extension: "pdf")
         sign_in(user)
 
         post "/uploads/lookup-urls.json", params: { short_urls: [upload.short_url] }
         expect(response.status).to eq(200)
 
-        result = JSON.parse(response.body)
-        expect(result[0]["url"]).not_to match("/secure-media-uploads")
+        result = response.parsed_body
+        expect(result[0]["url"]).to match("/secure-media-uploads")
         expect(result[0]["short_path"]).to eq(upload.short_path)
       end
     end
@@ -639,7 +695,7 @@ describe UploadsController do
 
         expect(response.status).to eq(200)
 
-        result = JSON.parse(response.body)
+        result = response.parsed_body
 
         expect(result["original_filename"]).to eq(upload.original_filename)
         expect(result["width"]).to eq(upload.width)

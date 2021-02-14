@@ -86,11 +86,6 @@ describe SvgSprite do
     expect(SvgSprite.all_icons).not_to include("  fab-facebook-messenger  ")
   end
 
-  it 'includes Font Awesome 4.7 icons from badges' do
-    Fabricate(:badge, name: 'Custom Icon Badge', icon: 'fa-gamepad')
-    expect(SvgSprite.all_icons).to include("gamepad")
-  end
-
   it 'includes Font Awesome 5 icons from badges' do
     Fabricate(:badge, name: 'Custom Icon Badge', icon: 'far fa-building')
     expect(SvgSprite.all_icons).to include("far-building")
@@ -142,6 +137,16 @@ describe SvgSprite do
     expect(SvgSprite.all_icons([parent_theme.id])).to include("dragon")
   end
 
+  it 'includes icons defined in theme modifiers' do
+    theme = Fabricate(:theme)
+
+    expect(SvgSprite.all_icons([theme.id])).not_to include("dragon")
+
+    theme.theme_modifier_set.svg_icons = ["dragon"]
+    theme.save!
+    expect(SvgSprite.all_icons([theme.id])).to include("dragon")
+  end
+
   it 'includes custom icons from a sprite in a theme' do
     theme = Fabricate(:theme)
     fname = "custom-theme-icon-sprite.svg"
@@ -159,11 +164,7 @@ describe SvgSprite do
     let(:upload_s3) { Fabricate(:upload_s3) }
 
     before do
-      SiteSetting.enable_s3_uploads = true
-      SiteSetting.s3_upload_bucket = "s3bucket"
-      SiteSetting.s3_access_key_id = "s3_access_key_id"
-      SiteSetting.s3_secret_access_key = "s3_secret_access_key"
-
+      setup_s3
       stub_request(:get, upload_s3.url).to_return(status: 200, body: "Hello world")
     end
 
@@ -205,13 +206,8 @@ describe SvgSprite do
     expect(SvgSprite.all_icons).to include("fab-bandcamp")
   end
 
-  it "includes Font Awesome 4.7 icons as group flair" do
-    group = Fabricate(:group, flair_url: "fa-air-freshener")
-    expect(SvgSprite.bundle).to match(/air-freshener/)
-  end
-
-  it "includes Font Awesome 5 icons as group flair" do
-    group = Fabricate(:group, flair_url: "far fa-building")
-    expect(SvgSprite.bundle).to match(/building/)
+  it "includes Font Awesome icon from groups" do
+    group = Fabricate(:group, flair_icon: "far-building")
+    expect(SvgSprite.bundle).to match(/far-building/)
   end
 end

@@ -52,7 +52,9 @@ class ListController < ApplicationController
       list_opts = build_topic_list_options
       list_opts.merge!(options) if options
       user = list_target_user
-      list_opts[:no_definitions] = true if params[:category].blank? && filter == :latest
+      if params[:category].blank? && filter == :latest && !SiteSetting.show_category_definitions_in_topic_lists
+        list_opts[:no_definitions] = true
+      end
 
       list = TopicQuery.new(user, list_opts).public_send("list_#{filter}")
 
@@ -60,7 +62,7 @@ class ListController < ApplicationController
         if @category.id == SiteSetting.shared_drafts_category.to_i
           # On shared drafts, show the destination category
           list.topics.each do |t|
-            t.includes_destination_category = true
+            t.includes_destination_category = t.shared_draft.present?
           end
         else
           # When viewing a non-shared draft category, find topics whose
@@ -121,6 +123,8 @@ class ListController < ApplicationController
   def topics_by
     list_opts = build_topic_list_options
     target_user = fetch_user_from_params({ include_inactive: current_user.try(:staff?) || (current_user && SiteSetting.show_inactive_accounts) }, [:user_stat, :user_option])
+    ensure_can_see_profile!(target_user)
+
     list = generate_list_for("topics_by", target_user, list_opts)
     list.more_topics_url = construct_url_with(:next, list_opts)
     list.prev_topics_url = construct_url_with(:prev, list_opts)
@@ -141,16 +145,36 @@ class ListController < ApplicationController
   end
 
   def self.generate_message_route(action)
-    define_method("#{action}") do
-      list_opts = build_topic_list_options
-      target_user = fetch_user_from_params({ include_inactive: current_user.try(:staff?) }, [:user_stat, :user_option])
-      guardian.ensure_can_see_private_messages!(target_user.id)
-      list = generate_list_for(action.to_s, target_user, list_opts)
-      url_prefix = "topics"
-      list.more_topics_url = construct_url_with(:next, list_opts, url_prefix)
-      list.prev_topics_url = construct_url_with(:prev, list_opts, url_prefix)
-      respond_with_list(list)
+    case action
+    when :private_messages_tag
+      define_method("#{action}") do
+        raise Discourse::NotFound if !guardian.can_tag_pms?
+        message_route(action)
+      end
+    when :private_messages_group, :private_messages_group_archive
+      define_method("#{action}") do
+        group = Group.find_by(name: params[:group_name])
+        raise Discourse::NotFound if !group
+        raise Discourse::NotFound unless guardian.can_see_group_messages?(group)
+
+        message_route(action)
+      end
+    else
+      define_method("#{action}") do
+        message_route(action)
+      end
     end
+  end
+
+  def message_route(action)
+    target_user = fetch_user_from_params({ include_inactive: current_user.try(:staff?) }, [:user_stat, :user_option])
+    guardian.ensure_can_see_private_messages!(target_user.id)
+    list_opts = build_topic_list_options
+    list = generate_list_for(action.to_s, target_user, list_opts)
+    url_prefix = "topics"
+    list.more_topics_url = construct_url_with(:next, list_opts, url_prefix)
+    list.prev_topics_url = construct_url_with(:prev, list_opts, url_prefix)
+    respond_with_list(list)
   end
 
   %i{
@@ -168,11 +192,13 @@ class ListController < ApplicationController
   def latest_feed
     discourse_expires_in 1.minute
 
+    options = { order: 'created' }.merge(build_topic_list_options)
+
     @title = "#{SiteSetting.title} - #{I18n.t("rss_description.latest")}"
     @link = "#{Discourse.base_url}/latest"
     @atom_link = "#{Discourse.base_url}/latest.rss"
     @description = I18n.t("rss_description.latest")
-    @topic_list = TopicQuery.new(nil, order: 'created').list_latest
+    @topic_list = TopicQuery.new(nil, options).list_latest
 
     render 'list', formats: [:rss]
   end
@@ -205,6 +231,7 @@ class ListController < ApplicationController
   def user_topics_feed
     discourse_expires_in 1.minute
     target_user = fetch_user_from_params
+    ensure_can_see_profile!(target_user)
 
     @title = "#{SiteSetting.title} - #{I18n.t("rss_description.user_topics", username: target_user.username)}"
     @link = "#{Discourse.base_url}/u/#{target_user.username}/activity/topics"
@@ -309,37 +336,45 @@ class ListController < ApplicationController
   end
 
   def set_category
-    parts = params.require(:category_slug_path_with_id).split('/')
+    category_slug_path_with_id = params.require(:category_slug_path_with_id)
 
-    if !parts.empty? && parts.last =~ /\A\d+\Z/
-      id = parts.pop.to_i
+    @category = Category.find_by_slug_path_with_id(category_slug_path_with_id)
+    if @category.nil?
+      raise Discourse::NotFound.new("category not found", check_permalinks: true)
     end
-    slug_path = parts unless parts.empty?
-
-    if id.present?
-      @category = Category.find_by_id(id)
-    elsif slug_path.present?
-      if (1..2).include?(slug_path.size)
-        @category = Category.find_by_slug(*slug_path.reverse)
-      end
-
-      # Legacy paths
-      if @category.nil? && parts.last =~ /\A\d+-category/
-        @category = Category.find_by_id(parts.last.to_i)
-      end
-    end
-
-    raise Discourse::NotFound.new("category not found", check_permalinks: true) if @category.nil?
 
     params[:category] = @category.id.to_s
 
-    @description_meta = @category.description_text
     if !guardian.can_see?(@category)
       if SiteSetting.detailed_404
         raise Discourse::InvalidAccess
       else
         raise Discourse::NotFound
       end
+    end
+
+    # Check if the category slug is incorrect and redirect to a link containing
+    # the correct one.
+    current_slug = category_slug_path_with_id
+    if SiteSetting.slug_generation_method == "encoded"
+      current_slug = current_slug.split("/").map { |slug| CGI.escape(slug) }.join("/")
+    end
+    real_slug = @category.full_slug("/")
+    if current_slug != real_slug
+      url = request.fullpath.gsub(current_slug, real_slug)
+      if ActionController::Base.config.relative_url_root
+        url = url.sub(ActionController::Base.config.relative_url_root, "")
+      end
+
+      return redirect_to path(url), status: 301
+    end
+
+    @description_meta = if @category.uncategorized?
+      I18n.t("category.uncategorized_description", locale: SiteSetting.default_locale)
+    elsif @category.description_text.present?
+      @category.description_text
+    else
+      SiteSetting.site_description
     end
 
     if use_crawler_layout?
@@ -379,6 +414,10 @@ class ListController < ApplicationController
     opts.delete(:category) if page_params.include?(:category_slug_path_with_id)
 
     public_send(method, opts.merge(page_params)).sub('.json?', '?')
+  end
+
+  def ensure_can_see_profile!(target_user = nil)
+    raise Discourse::NotFound unless guardian.can_see_profile?(target_user)
   end
 
   def self.best_period_for(previous_visit_at, category_id = nil)

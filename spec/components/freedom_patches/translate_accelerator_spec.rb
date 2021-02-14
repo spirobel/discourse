@@ -30,7 +30,7 @@ describe "translate accelerator" do
     orig = I18n.t('i_am_an_unknown_key99')
 
     expect(I18n.t('i_am_an_unknown_key99').object_id).to eq(orig.object_id)
-    expect(I18n.t('i_am_an_unknown_key99')).to eq("translation missing: en_US.i_am_an_unknown_key99")
+    expect(I18n.t('i_am_an_unknown_key99')).to eq("translation missing: en.i_am_an_unknown_key99")
   end
 
   it "returns the correct language" do
@@ -170,6 +170,16 @@ describe "translate accelerator" do
       override_translation('en', 'items.other', '%{count} fishies')
       expect(I18n.t('items', count: 13)).to eq('13 fishies')
       expect(I18n.t('items', count: 1)).to eq('one fish')
+    end
+
+    it "supports one and other with fallback locale" do
+      override_translation('en_GB', 'items.one', 'one fish')
+      override_translation('en_GB', 'items.other', '%{count} fishies')
+
+      I18n.with_locale(:en_GB) do
+        expect(I18n.t('items', count: 13)).to eq('13 fishies')
+        expect(I18n.t('items', count: 1)).to eq('one fish')
+      end
     end
 
     it "supports one and other when only a single pluralization key is overridden" do

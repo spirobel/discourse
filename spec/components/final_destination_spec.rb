@@ -396,7 +396,7 @@ describe FinalDestination do
     end
 
     it "returns false for IPV6 via site settings" do
-      SiteSetting.blacklist_ip_blocks = '2001:abc:de::/48|2002:abc:de::/48'
+      SiteSetting.blocked_ip_blocks = '2001:abc:de::/48|2002:abc:de::/48'
       expect(fd('https://[2001:abc:de:01:0:3f0:6a65:c2bf]').is_dest_valid?).to eq(false)
       expect(fd('https://[2002:abc:de:01:0:3f0:6a65:c2bf]').is_dest_valid?).to eq(false)
       expect(fd('https://internal-ipv6.com').is_dest_valid?).to eq(false)
@@ -404,7 +404,7 @@ describe FinalDestination do
     end
 
     it "ignores invalid ranges" do
-      SiteSetting.blacklist_ip_blocks = '2001:abc:de::/48|eviltrout'
+      SiteSetting.blocked_ip_blocks = '2001:abc:de::/48|eviltrout'
       expect(fd('https://[2001:abc:de:01:0:3f0:6a65:c2bf]').is_dest_valid?).to eq(false)
     end
 
@@ -432,8 +432,8 @@ describe FinalDestination do
       expect(fd("https://cdn.example.com/some/asset").is_dest_valid?).to eq(true)
     end
 
-    it 'supports whitelisting via a site setting' do
-      SiteSetting.whitelist_internal_hosts = 'private-host.com'
+    it 'supports allowlisting via a site setting' do
+      SiteSetting.allowed_internal_hosts = 'private-host.com'
       expect(fd("https://private-host.com/some/url").is_dest_valid?).to eq(true)
     end
   end
@@ -463,7 +463,7 @@ describe FinalDestination do
       expect(fd(fragment_url).escape_url.to_s).to eq(fragment_url)
 
       expect(fd("https://eviltrout.com?s=180&#038;d=mm&#038;r=g").escape_url.to_s)
-        .to eq("https://eviltrout.com?s=180&d=mm&r=g")
+        .to eq("https://eviltrout.com?s=180&#038;d=mm&%23038;r=g")
 
       expect(fd("http://example.com/?a=\11\15").escape_url.to_s).to eq("http://example.com/?a=%09%0D")
 

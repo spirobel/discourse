@@ -23,27 +23,11 @@ class ThemeStore::GitImporter
     else
       import_public!
     end
-  end
-
-  def diff_local_changes(remote_theme_id)
-    theme = Theme.find_by(remote_theme_id: remote_theme_id)
-    raise Discourse::InvalidParameters.new(:id) unless theme
-    local_version = theme.remote_theme&.local_version
-
-    exporter = ThemeStore::ZipExporter.new(theme)
-    local_temp_folder = exporter.export_to_folder
-
-    Discourse::Utils.execute_command(chdir: @temp_folder) do |runner|
-      runner.exec("git", "checkout", local_version)
-      runner.exec("rm -rf ./*/")
-      runner.exec("cp", "-rf", "#{local_temp_folder}/#{exporter.export_name}/.", @temp_folder)
-      runner.exec("git", "checkout", "about.json")
-      # add + diff staged to catch uploads but exclude renamed assets
-      runner.exec("git", "add", "-A")
-      return runner.exec("git", "diff", "--staged", "--diff-filter=r")
+    if version = Discourse.find_compatible_git_resource(@temp_folder)
+      Discourse::Utils.execute_command(chdir: @temp_folder) do |runner|
+        return runner.exec("git cat-file -e #{version} || git fetch --depth 1 $(git rev-parse --symbolic-full-name @{upstream} | awk -F '/' '{print $3}') #{version}; git reset --hard #{version}")
+      end
     end
-  ensure
-    FileUtils.rm_rf local_temp_folder if local_temp_folder
   end
 
   def commits_since(hash)
@@ -51,7 +35,7 @@ class ThemeStore::GitImporter
 
     Discourse::Utils.execute_command(chdir: @temp_folder) do |runner|
       commit_hash = runner.exec("git", "rev-parse", "HEAD").strip
-      commits_behind = runner.exec("git", "rev-list", "#{hash}..HEAD", "--count").strip
+      commits_behind = runner.exec("git", "rev-list", "#{hash}..HEAD", "--count").strip rescue -1
     end
 
     [commit_hash, commits_behind]
@@ -107,7 +91,7 @@ class ThemeStore::GitImporter
     ssh_folder = "#{Pathname.new(Dir.tmpdir).realpath}/discourse_theme_ssh_#{SecureRandom.hex}"
     FileUtils.mkdir_p ssh_folder
 
-    File.write("#{ssh_folder}/id_rsa", @private_key.strip)
+    File.write("#{ssh_folder}/id_rsa", @private_key)
     FileUtils.chmod(0600, "#{ssh_folder}/id_rsa")
 
     begin

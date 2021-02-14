@@ -24,7 +24,7 @@
 // The 'left' and 'right' in these selectors is not being flipped by r2.
 .rtl .nav-stacked a.active::after {
   border-left-color: transparent !important;
-  border-right-color: $secondary !important;
+  border-right-color: var(--secondary) !important;
 }
 .rtl code {
   direction: ltr !important;
@@ -118,5 +118,14 @@
     .nav-stacked {
       margin: 0 -10px 0 10px !important;
     }
+  }
+}
+
+.rtl .ace_placeholder {
+  direction: rtl !important;
+  text-align: right !important;
+
+  [dir="ltr"] {
+    text-align: left !important;
   }
 }

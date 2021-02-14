@@ -12,20 +12,69 @@ describe BookmarksController do
   end
 
   describe "#create" do
+    it "rate limits creates" do
+      SiteSetting.max_bookmarks_per_day = 1
+      RateLimiter.enable
+      RateLimiter.clear_all!
+
+      post "/bookmarks.json", params: {
+        post_id: bookmark_post.id,
+        reminder_type: "tomorrow",
+        reminder_at: (Time.zone.now + 1.day).iso8601
+      }
+
+      expect(response.status).to eq(200)
+
+      post "/bookmarks.json", params: {
+        post_id: Fabricate(:post).id
+      }
+      expect(response.status).to eq(429)
+    end
+
+    context "if the user reached the max bookmark limit" do
+      before do
+        @old_constant = Bookmark::BOOKMARK_LIMIT
+        Bookmark.send(:remove_const, "BOOKMARK_LIMIT")
+        Bookmark.const_set("BOOKMARK_LIMIT", 1)
+      end
+
+      it "returns failed JSON with a 400 error" do
+        post "/bookmarks.json", params: {
+          post_id: bookmark_post.id,
+          reminder_type: "tomorrow",
+          reminder_at: (Time.zone.now + 1.day).iso8601
+        }
+        post "/bookmarks.json", params: {
+          post_id: Fabricate(:post).id
+        }
+
+        expect(response.status).to eq(400)
+        user_bookmarks_url = "#{Discourse.base_url}/my/activity/bookmarks"
+        expect(response.parsed_body['errors']).to include(
+          I18n.t("bookmarks.errors.too_many", user_bookmarks_url: user_bookmarks_url)
+        )
+      end
+
+      after do
+        Bookmark.send(:remove_const, "BOOKMARK_LIMIT")
+        Bookmark.const_set("BOOKMARK_LIMIT", @old_constant)
+      end
+    end
+
     context "if the user already has bookmarked the post" do
       before do
         Fabricate(:bookmark, post: bookmark_post, user: bookmark_user)
       end
 
-      it "returns failed JSON with a 422 error" do
+      it "returns failed JSON with a 400 error" do
         post "/bookmarks.json", params: {
           post_id: bookmark_post.id,
           reminder_type: "tomorrow",
-          reminder_at: (Time.now.utc + 1.day).iso8601
+          reminder_at: (Time.zone.now + 1.day).iso8601
         }
 
-        expect(response.status).to eq(422)
-        expect(JSON.parse(response.body)['errors']).to include(
+        expect(response.status).to eq(400)
+        expect(response.parsed_body['errors']).to include(
           I18n.t("bookmarks.errors.already_bookmarked_post")
         )
       end
@@ -39,8 +88,8 @@ describe BookmarksController do
         }
 
         expect(response.status).to eq(400)
-        expect(JSON.parse(response.body)['errors'].first).to include(
-          I18n.t("bookmarks.errors.time_must_be_provided", reminder_type: I18n.t("bookmarks.reminders.at_desktop"))
+        expect(response.parsed_body['errors'].first).to include(
+          I18n.t("bookmarks.errors.time_must_be_provided")
         )
       end
     end
@@ -60,7 +109,7 @@ describe BookmarksController do
         delete "/bookmarks/#{bookmark.id}.json"
 
         expect(response.status).to eq(404)
-        expect(JSON.parse(response.body)['errors'].first).to include(
+        expect(response.parsed_body['errors'].first).to include(
           I18n.t("not_found")
         )
       end
@@ -73,7 +122,7 @@ describe BookmarksController do
         delete "/bookmarks/#{bookmark.id}.json"
 
         expect(response.status).to eq(403)
-        expect(JSON.parse(response.body)['errors'].first).to include(
+        expect(response.parsed_body['errors'].first).to include(
           I18n.t("invalid_access")
         )
       end

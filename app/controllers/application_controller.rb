@@ -31,32 +31,26 @@ class ApplicationController < ActionController::Base
   before_action :check_readonly_mode
   before_action :handle_theme
   before_action :set_current_user_for_logs
+  before_action :set_mp_snapshot_fields
   before_action :clear_notifications
-  before_action :set_locale
+  around_action :with_resolved_locale
   before_action :set_mobile_view
   before_action :block_if_readonly_mode
   before_action :authorize_mini_profiler
   before_action :redirect_to_login_if_required
   before_action :block_if_requires_login
   before_action :preload_json
+  before_action :add_noindex_header, if: -> { is_feed_request? || !SiteSetting.allow_index_in_robots_txt }
   before_action :check_xhr
   after_action  :add_readonly_header
   after_action  :perform_refresh_session
   after_action  :dont_cache_page
   after_action  :conditionally_allow_site_embedding
-  after_action  :add_noindex_header, if: -> { is_feed_request? }
+
+  HONEYPOT_KEY ||= 'HONEYPOT_KEY'
+  CHALLENGE_KEY ||= 'CHALLENGE_KEY'
 
   layout :set_layout
-
-  if Rails.env == "development"
-    after_action :remember_theme_id
-
-    def remember_theme_id
-      if @theme_ids.present? && request.format == "html"
-        Stylesheet::Watcher.theme_id = @theme_ids.first if defined? Stylesheet::Watcher
-      end
-    end
-  end
 
   def has_escaped_fragment?
     SiteSetting.enable_escaped_fragments? && params.key?("_escaped_fragment_")
@@ -110,7 +104,7 @@ class ApplicationController < ActionController::Base
   class PluginDisabled < StandardError; end
 
   rescue_from RenderEmpty do
-    render 'default/empty'
+    with_resolved_locale { render 'default/empty' }
   end
 
   rescue_from ArgumentError do |e|
@@ -124,7 +118,7 @@ class ApplicationController < ActionController::Base
   rescue_from PG::ReadOnlySqlTransaction do |e|
     Discourse.received_postgres_readonly!
     Rails.logger.error("#{e.class} #{e.message}: #{e.backtrace.join("\n")}")
-    raise Discourse::ReadOnly
+    rescue_with_handler(Discourse::ReadOnly.new) || raise
   end
 
   rescue_from ActionController::ParameterMissing do |e|
@@ -161,13 +155,15 @@ class ApplicationController < ActionController::Base
   rescue_from RateLimiter::LimitExceeded do |e|
     retry_time_in_seconds = e&.available_in
 
-    render_json_error(
-      e.description,
-      type: :rate_limit,
-      status: 429,
-      extras: { wait_seconds: retry_time_in_seconds },
-      headers: { 'Retry-After': retry_time_in_seconds },
-    )
+    with_resolved_locale do
+      render_json_error(
+        e.description,
+        type: :rate_limit,
+        status: 429,
+        extras: { wait_seconds: retry_time_in_seconds },
+        headers: { 'Retry-After': retry_time_in_seconds }
+      )
+    end
   end
 
   rescue_from Discourse::NotLoggedIn do |e|
@@ -179,11 +175,15 @@ class ApplicationController < ActionController::Base
   end
 
   rescue_from Discourse::InvalidParameters do |e|
-    message = I18n.t('invalid_params', message: e.message)
+    opts = {
+      custom_message: 'invalid_params',
+      custom_message_params: { message: e.message }
+    }
+
     if (request.format && request.format.json?) || request.xhr? || !request.get?
-      rescue_discourse_actions(:invalid_parameters, 400, include_ember: true, custom_message_translated: message)
+      rescue_discourse_actions(:invalid_parameters, 400, opts.merge(include_ember: true))
     else
-      rescue_discourse_actions(:not_found, 400, custom_message_translated: message)
+      rescue_discourse_actions(:not_found, 400, opts)
     end
   end
 
@@ -207,12 +207,15 @@ class ApplicationController < ActionController::Base
       403,
       include_ember: true,
       custom_message: e.custom_message,
+      custom_message_params: e.custom_message_params,
       group: e.group
     )
   end
 
   rescue_from Discourse::ReadOnly do
-    render_json_error I18n.t('read_only_mode_enabled'), type: :read_only, status: 503
+    unless response_body
+      render_json_error I18n.t('read_only_mode_enabled'), type: :read_only, status: 503
+    end
   end
 
   def redirect_with_client_support(url, options)
@@ -243,19 +246,30 @@ class ApplicationController < ActionController::Base
       end
     end
 
-    message = opts[:custom_message_translated] || I18n.t(opts[:custom_message] || type)
-    error_page_opts = {
-      title: opts[:custom_message_translated] || I18n.t(opts[:custom_message] || "page_not_found.title"),
-      status: status_code,
-      group: opts[:group]
-    }
+    message = title = nil
+    with_resolved_locale(check_current_user: false) do
+      if opts[:custom_message]
+        title = message = I18n.t(opts[:custom_message], opts[:custom_message_params] || {})
+      else
+        message = I18n.t(type)
+        if status_code == 403
+          title = I18n.t("page_forbidden.title")
+        else
+          title = I18n.t("page_not_found.title")
+        end
+      end
+    end
+
+    error_page_opts = { title: title, status: status_code, group: opts[:group] }
 
     if show_json_errors
       opts = { type: type, status: status_code }
 
-      # Include error in HTML format for topics#show.
-      if (request.params[:controller] == 'topics' && request.params[:action] == 'show') || (request.params[:controller] == 'categories' && request.params[:action] == 'find_by_slug')
-        opts[:extras] = { html: build_not_found_page(error_page_opts) }
+      with_resolved_locale(check_current_user: false) do
+        # Include error in HTML format for topics#show.
+        if (request.params[:controller] == 'topics' && request.params[:action] == 'show') || (request.params[:controller] == 'categories' && request.params[:action] == 'find_by_slug')
+          opts[:extras] = { html: build_not_found_page(error_page_opts) }
+        end
       end
 
       render_json_error message, opts
@@ -267,9 +281,10 @@ class ApplicationController < ActionController::Base
       rescue Discourse::InvalidAccess
         return render plain: message, status: status_code
       end
-
-      error_page_opts[:layout] = opts[:include_ember] ? 'application' : 'no_ember'
-      render html: build_not_found_page(error_page_opts)
+      with_resolved_locale do
+        error_page_opts[:layout] = opts[:include_ember] ? 'application' : 'no_ember'
+        render html: build_not_found_page(error_page_opts)
+      end
     end
   end
 
@@ -287,6 +302,15 @@ class ApplicationController < ActionController::Base
       response.headers["X-Discourse-Username"] = current_user.username
     end
     response.headers["X-Discourse-Route"] = "#{controller_name}/#{action_name}"
+  end
+
+  def set_mp_snapshot_fields
+    if defined?(Rack::MiniProfiler)
+      Rack::MiniProfiler.add_snapshot_custom_field("Application version", Discourse.git_version)
+      if Rack::MiniProfiler.snapshots_transporter?
+        Rack::MiniProfiler.add_snapshot_custom_field("Site", Discourse.current_hostname)
+      end
+    end
   end
 
   def clear_notifications
@@ -309,25 +333,29 @@ class ApplicationController < ActionController::Base
         current_user.reload
         current_user.publish_notifications_state
         cookie_args = {}
-        cookie_args[:path] = Discourse.base_uri if Discourse.base_uri.present?
+        cookie_args[:path] = Discourse.base_path if Discourse.base_path.present?
         cookies.delete('cn', cookie_args)
       end
     end
   end
 
-  def set_locale
-    if !current_user
+  def with_resolved_locale(check_current_user: true)
+    if check_current_user && (user = current_user rescue nil)
+      locale = user.effective_locale
+    else
       if SiteSetting.set_locale_from_accept_language_header
         locale = locale_from_header
       else
         locale = SiteSetting.default_locale
       end
-    else
-      locale = current_user.effective_locale
     end
 
-    I18n.locale = I18n.locale_available?(locale) ? locale : SiteSettings::DefaultsProvider::DEFAULT_LOCALE
+    if !I18n.locale_available?(locale)
+      locale = SiteSettings::DefaultsProvider::DEFAULT_LOCALE
+    end
+
     I18n.ensure_all_loaded!
+    I18n.with_locale(locale) { yield }
   end
 
   def store_preloaded(key, json)
@@ -376,8 +404,7 @@ class ApplicationController < ActionController::Base
   end
 
   def handle_theme
-    return if request.xhr? || request.format == "json" || request.format == "js"
-    return if request.method != "GET"
+    return if request.format == "js"
 
     resolve_safe_mode
     return if request.env[NO_CUSTOM]
@@ -405,7 +432,9 @@ class ApplicationController < ActionController::Base
     end
 
     if theme_ids.blank? && SiteSetting.default_theme_id != -1
-      theme_ids << SiteSetting.default_theme_id
+      if guardian.allow_themes?([SiteSetting.default_theme_id])
+        theme_ids << SiteSetting.default_theme_id
+      end
     end
 
     @theme_ids = request.env[:resolved_theme_ids] = theme_ids
@@ -474,7 +503,14 @@ class ApplicationController < ActionController::Base
       result.find_by(find_opts)
     elsif params[:external_id]
       external_id = params[:external_id].chomp('.json')
-      SingleSignOnRecord.find_by(external_id: external_id).try(:user)
+      if provider_name = params[:external_provider]
+        raise Discourse::InvalidAccess unless guardian.is_admin? # external_id might be something sensitive
+        provider = Discourse.enabled_authenticators.find { |a| a.name == provider_name }
+        raise Discourse::NotFound if !provider&.is_managed? # Only managed authenticators use UserAssociatedAccount
+        UserAssociatedAccount.find_by(provider_name: provider_name, provider_uid: external_id)&.user
+      else
+        SingleSignOnRecord.find_by(external_id: external_id).try(:user)
+      end
     end
     raise Discourse::NotFound if user.blank?
 
@@ -506,20 +542,20 @@ class ApplicationController < ActionController::Base
     end
   end
 
+  def rate_limit_second_factor!(user)
+    return if params[:second_factor_token].blank?
+
+    RateLimiter.new(nil, "second-factor-min-#{request.remote_ip}", 6, 1.minute).performed!
+
+    if user
+      RateLimiter.new(nil, "second-factor-min-#{user.username}", 6, 1.minute).performed!
+    end
+  end
+
   private
 
   def locale_from_header
-    begin
-      # Rails I18n uses underscores between the locale and the region; the request
-      # headers use hyphens.
-      require 'http_accept_language' unless defined? HttpAcceptLanguage
-      available_locales = I18n.available_locales.map { |locale| locale.to_s.tr('_', '-') }
-      parser = HttpAcceptLanguage::Parser.new(request.env["HTTP_ACCEPT_LANGUAGE"])
-      parser.language_region_compatible_from(available_locales).tr('-', '_')
-    rescue
-      # If Accept-Language headers are not set.
-      I18n.default_locale
-    end
+    HttpLanguageParser.parse(request.env["HTTP_ACCEPT_LANGUAGE"])
   end
 
   def preload_anonymous_data
@@ -528,6 +564,7 @@ class ApplicationController < ActionController::Base
     store_preloaded("customHTML", custom_html_json)
     store_preloaded("banner", banner_json)
     store_preloaded("customEmoji", custom_emoji)
+    store_preloaded("isReadOnly", @readonly_mode.to_s)
   end
 
   def preload_current_user_data
@@ -650,7 +687,11 @@ class ApplicationController < ActionController::Base
   def check_xhr
     # bypass xhr check on PUT / POST / DELETE provided api key is there, otherwise calling api is annoying
     return if !request.get? && (is_api? || is_user_api?)
-    raise RenderEmpty.new unless ((request.format && request.format.json?) || request.xhr?)
+    raise ApplicationController::RenderEmpty.new unless ((request.format && request.format.json?) || request.xhr?)
+  end
+
+  def apply_cdn_headers
+    Discourse.apply_cdn_headers(response.headers) if Discourse.is_cdn_request?(request.env, request.method)
   end
 
   def self.requires_login(arg = {})
@@ -698,11 +739,11 @@ class ApplicationController < ActionController::Base
   def redirect_to_login
     dont_cache_page
 
-    if SiteSetting.enable_sso?
+    if SiteSetting.auth_immediately && SiteSetting.enable_discourse_connect?
       # save original URL in a session so we can redirect after login
       session[:destination_url] = destination_url
       redirect_to path('/session/sso')
-    elsif !SiteSetting.enable_local_logins && Discourse.enabled_authenticators.length == 1 && !cookies[:authentication_data]
+    elsif SiteSetting.auth_immediately && !SiteSetting.enable_local_logins && Discourse.enabled_authenticators.length == 1 && !cookies[:authentication_data]
       # Only one authentication provider, direct straight to it.
       # If authentication_data is present, then we are halfway though registration. Don't redirect offsite
       cookies[:destination_url] = destination_url
@@ -749,7 +790,7 @@ class ApplicationController < ActionController::Base
     return if !current_user
     return if !should_enforce_2fa?
 
-    redirect_path = "#{GlobalSetting.relative_url_root}/u/#{current_user.username}/preferences/second-factor"
+    redirect_path = path("/u/#{current_user.encoded_username}/preferences/second-factor")
     if !request.fullpath.start_with?(redirect_path)
       redirect_to path(redirect_path)
       nil
@@ -773,17 +814,16 @@ class ApplicationController < ActionController::Base
       opts[:layout] = 'application' if opts[:layout] == 'no_ember'
     end
 
-    if !SiteSetting.login_required? || (current_user rescue false)
-      key = "page_not_found_topics"
-      if @topics_partial = Discourse.redis.get(key)
-        @topics_partial = @topics_partial.html_safe
-      else
+    @current_user = current_user rescue nil
+
+    if !SiteSetting.login_required? || @current_user
+      key = "page_not_found_topics:#{I18n.locale}"
+      @topics_partial = Discourse.cache.fetch(key, expires_in: 10.minutes) do
         category_topic_ids = Category.pluck(:topic_id).compact
         @top_viewed = TopicQuery.new(nil, except_topic_ids: category_topic_ids).list_top_for("monthly").topics.first(10)
         @recent = Topic.includes(:category).where.not(id: category_topic_ids).recent(10)
-        @topics_partial = render_to_string partial: '/exceptions/not_found_topics', formats: [:html]
-        Discourse.redis.setex(key, 10.minutes, @topics_partial)
-      end
+        render_to_string partial: '/exceptions/not_found_topics', formats: [:html]
+      end.html_safe
     end
 
     @container_class = "wrap not-found-container"
@@ -793,7 +833,7 @@ class ApplicationController < ActionController::Base
 
     params[:slug] = params[:slug].first if params[:slug].kind_of?(Array)
     params[:id] = params[:id].first if params[:id].kind_of?(Array)
-    @slug = (params[:slug].presence || params[:id].presence || "").tr('-', ' ')
+    @slug = (params[:slug].presence || params[:id].presence || "").to_s.tr('-', ' ')
 
     render_to_string status: opts[:status], layout: opts[:layout], formats: [:html], template: '/exceptions/not_found'
   end
@@ -807,10 +847,24 @@ class ApplicationController < ActionController::Base
   end
 
   def add_noindex_header
-    response.headers['X-Robots-Tag'] = 'noindex'
+    if request.get?
+      if SiteSetting.allow_index_in_robots_txt
+        response.headers['X-Robots-Tag'] = 'noindex'
+      else
+        response.headers['X-Robots-Tag'] = 'noindex, nofollow'
+      end
+    end
   end
 
   protected
+
+  def honeypot_value
+    secure_session[HONEYPOT_KEY] ||= SecureRandom.hex
+  end
+
+  def challenge_value
+    secure_session[CHALLENGE_KEY] ||= SecureRandom.hex
+  end
 
   def render_post_json(post, add_raw: true)
     post_serializer = PostSerializer.new(post, scope: guardian, root: false)

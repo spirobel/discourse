@@ -49,6 +49,7 @@ class PostMover
       DiscourseTagging.tag_topic_by_names(new_topic, Guardian.new(user), tags)
       move_posts_to new_topic
       watch_new_topic
+      update_topic_excerpt new_topic
       new_topic
     end
     enqueue_jobs(topic)
@@ -56,6 +57,10 @@ class PostMover
   end
 
   private
+
+  def update_topic_excerpt(topic)
+    topic.update_excerpt(topic.first_post.excerpt_for_topic)
+  end
 
   def move_posts_to(topic)
     Guardian.new(user).ensure_can_see! topic
@@ -66,7 +71,7 @@ class PostMover
     create_temp_table
     delete_invalid_post_timings
     move_each_post
-    notify_users_that_posts_have_moved
+    create_moderator_post_in_original_topic
     update_statistics
     update_user_actions
     update_last_post_stats
@@ -332,8 +337,7 @@ class PostMover
       old_topic_id: original_topic.id,
       new_topic_id: destination_topic.id,
       old_highest_post_number: destination_topic.highest_post_number,
-      old_highest_staff_post_number: destination_topic.highest_staff_post_number,
-      default_notification_level: NotificationLevels.topic_levels[:regular]
+      old_highest_staff_post_number: destination_topic.highest_staff_post_number
     }
 
     DB.exec(<<~SQL, params)
@@ -342,9 +346,13 @@ class PostMover
                               notifications_changed_at, notifications_reason_id)
       SELECT tu.user_id,
              :new_topic_id                               AS topic_id,
-             CASE
-               WHEN p.user_id IS NULL THEN FALSE
-               ELSE TRUE END                             AS posted,
+               EXISTS(
+                 SELECT 1
+                 FROM posts p
+                 WHERE p.topic_id = :new_topic_id
+                   AND p.user_id = tu.user_id
+                 LIMIT 1
+               )                                         AS posted,
              (
                SELECT MAX(lr.new_post_number)
                FROM moved_posts lr
@@ -365,19 +373,11 @@ class PostMover
              )                                           AS last_emailed_post_number,
              GREATEST(tu.first_visited_at, t.created_at) AS first_visited_at,
              GREATEST(tu.last_visited_at, t.created_at)  AS last_visited_at,
-             CASE
-               WHEN p.user_id IS NOT NULL THEN tu.notification_level
-               ELSE :default_notification_level END      AS notification_level,
+             tu.notification_level,
              tu.notifications_changed_at,
              tu.notifications_reason_id
       FROM topic_users tu
            JOIN topics t ON (t.id = :new_topic_id)
-           LEFT OUTER JOIN
-           (
-             SELECT DISTINCT user_id
-             FROM posts
-             WHERE topic_id = :new_topic_id
-           ) p ON (p.user_id = tu.user_id)
       WHERE tu.topic_id = :old_topic_id
         AND GREATEST(
                 tu.last_read_post_number,
@@ -436,19 +436,6 @@ class PostMover
 
   def update_user_actions
     UserAction.synchronize_target_topic_ids(posts.map(&:id))
-  end
-
-  def notify_users_that_posts_have_moved
-    enqueue_notification_job
-    create_moderator_post_in_original_topic
-  end
-
-  def enqueue_notification_job
-    Jobs.enqueue(
-      :notify_moved_posts,
-      post_ids: post_ids,
-      moved_by_id: user.id
-    )
   end
 
   def create_moderator_post_in_original_topic
@@ -537,6 +524,12 @@ class PostMover
 
   def enqueue_jobs(topic)
     @post_creator.enqueue_jobs if @post_creator
+
+    Jobs.enqueue(
+      :notify_moved_posts,
+      post_ids: post_ids,
+      moved_by_id: user.id
+    )
 
     Jobs.enqueue(
       :delete_inaccessible_notifications,

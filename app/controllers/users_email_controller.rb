@@ -20,22 +20,43 @@ class UsersEmailController < ApplicationController
 
   before_action :require_login, only: [
     :confirm_old_email,
-    :show_confirm_old_email,
-    :confirm_new_email,
-    :show_confirm_new_email
+    :show_confirm_old_email
   ]
 
   def index
+  end
+
+  def create
+    if !SiteSetting.enable_secondary_emails
+      return render json: failed_json, status: 410
+    end
+
+    params.require(:email)
+    user = fetch_user_from_params
+
+    RateLimiter.new(user, "email-hr-#{request.remote_ip}", 6, 1.hour).performed!
+    RateLimiter.new(user, "email-min-#{request.remote_ip}", 3, 1.minute).performed!
+
+    updater = EmailUpdater.new(guardian: guardian, user: user)
+    updater.change_to(params[:email], add: true)
+
+    if updater.errors.present?
+      return render_json_error(updater.errors.full_messages)
+    end
+
+    render body: nil
+  rescue RateLimiter::LimitExceeded
+    render_json_error(I18n.t("rate_limiter.slow_down"))
   end
 
   def update
     params.require(:email)
     user = fetch_user_from_params
 
-    RateLimiter.new(user, "change-email-hr-#{request.remote_ip}", 6, 1.hour).performed!
-    RateLimiter.new(user, "change-email-min-#{request.remote_ip}", 3, 1.minute).performed!
+    RateLimiter.new(user, "email-hr-#{request.remote_ip}", 6, 1.hour).performed!
+    RateLimiter.new(user, "email-min-#{request.remote_ip}", 3, 1.minute).performed!
 
-    updater = EmailUpdater.new(guardian: guardian, user: user, initiating_user: current_user)
+    updater = EmailUpdater.new(guardian: guardian, user: user)
     updater.change_to(params[:email])
 
     if updater.errors.present?
@@ -56,7 +77,7 @@ class UsersEmailController < ApplicationController
 
     redirect_url = path("/u/confirm-new-email/#{params[:token]}")
 
-    RateLimiter.new(nil, "second-factor-min-#{request.remote_ip}", 3, 1.minute).performed! if params[:second_factor_token].present?
+    rate_limit_second_factor!(@user)
 
     if !@error
       # this is needed becase the form posts this field as JSON and it can be a
@@ -195,7 +216,7 @@ class UsersEmailController < ApplicationController
       @error = I18n.t("change_email.already_done")
     end
 
-    if current_user.id != @user&.id
+    if current_user && current_user.id != @user&.id
       @error = I18n.t 'change_email.wrong_account_error'
     end
   end

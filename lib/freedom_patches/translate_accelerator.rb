@@ -21,8 +21,8 @@ module I18n
 
     LRU_CACHE_SIZE = 400
 
-    def init_accelerator!
-      @overrides_enabled = true
+    def init_accelerator!(overrides_enabled: true)
+      @overrides_enabled = overrides_enabled
       execute_reload
     end
 
@@ -71,7 +71,7 @@ module I18n
       opts ||= {}
 
       target = opts[:backend] || backend
-      results = opts[:overridden] ? {} : target.search(config.locale, query)
+      results = opts[:overridden] ? {} : target.search(locale, query)
 
       regexp = I18n::Backend::DiscourseI18n.create_search_regexp(query)
       (overrides_by_locale(locale) || {}).each do |k, v|
@@ -164,7 +164,7 @@ module I18n
 
       by_site[locale].with_indifferent_access
     rescue ActiveRecord::StatementInvalid => e
-      if PG::UndefinedTable === e.cause
+      if PG::UndefinedTable === e.cause || PG::UndefinedColumn === e.cause
         {}
       else
         raise

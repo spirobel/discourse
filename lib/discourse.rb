@@ -17,6 +17,7 @@ end
 
 module Discourse
   DB_POST_MIGRATE_PATH ||= "db/post_migrate"
+  REQUESTED_HOSTNAME ||= "REQUESTED_HOSTNAME"
 
   require 'sidekiq/exception_handler'
   class SidekiqExceptionHandler
@@ -24,6 +25,8 @@ module Discourse
   end
 
   class Utils
+    URI_REGEXP ||= URI.regexp(%w{http https})
+
     # Usage:
     #   Discourse::Utils.execute_command("pwd", chdir: 'mydirectory')
     # or with a block
@@ -42,7 +45,40 @@ module Discourse
     end
 
     def self.pretty_logs(logs)
-      logs.join("\n".freeze)
+      logs.join("\n")
+    end
+
+    def self.atomic_write_file(destination, contents)
+      begin
+        return if File.read(destination) == contents
+      rescue Errno::ENOENT
+      end
+
+      FileUtils.mkdir_p(File.join(Rails.root, 'tmp'))
+      temp_destination = File.join(Rails.root, 'tmp', SecureRandom.hex)
+
+      File.open(temp_destination, "w") do |fd|
+        fd.write(contents)
+        fd.fsync()
+      end
+
+      File.rename(temp_destination, destination)
+
+      nil
+    end
+
+    def self.atomic_ln_s(source, destination)
+      begin
+        return if File.readlink(destination) == source
+      rescue Errno::ENOENT, Errno::EINVAL
+      end
+
+      FileUtils.mkdir_p(File.join(Rails.root, 'tmp'))
+      temp_destination = File.join(Rails.root, 'tmp', SecureRandom.hex)
+      execute_command('ln', '-s', source, temp_destination)
+      File.rename(temp_destination, destination)
+
+      nil
     end
 
     private
@@ -107,6 +143,7 @@ module Discourse
     attr_reader :obj
     attr_reader :opts
     attr_reader :custom_message
+    attr_reader :custom_message_params
     attr_reader :group
 
     def initialize(msg = nil, obj = nil, opts = nil)
@@ -115,6 +152,7 @@ module Discourse
       @opts = opts || {}
       @obj = obj
       @custom_message = opts[:custom_message] if @opts[:custom_message]
+      @custom_message_params = opts[:custom_message_params] if @opts[:custom_message_params]
       @group = opts[:group] if @opts[:group]
     end
   end
@@ -153,7 +191,7 @@ module Discourse
   class ScssError < StandardError; end
 
   def self.filters
-    @filters ||= [:latest, :unread, :new, :read, :posted, :bookmarks]
+    @filters ||= [:latest, :unread, :new, :top, :read, :posted, :bookmarks]
   end
 
   def self.anonymous_filters
@@ -161,7 +199,7 @@ module Discourse
   end
 
   def self.top_menu_items
-    @top_menu_items ||= Discourse.filters + [:categories, :top]
+    @top_menu_items ||= Discourse.filters + [:categories]
   end
 
   def self.anonymous_top_menu_items
@@ -238,6 +276,10 @@ module Discourse
   def self.find_plugin_css_assets(args)
     plugins = self.find_plugins(args)
 
+    plugins = plugins.select do |plugin|
+      plugin.asset_filters.all? { |b| b.call(:css, args[:request]) }
+    end
+
     assets = []
 
     targets = [nil]
@@ -256,9 +298,15 @@ module Discourse
   end
 
   def self.find_plugin_js_assets(args)
-    self.find_plugins(args).find_all do |plugin|
+    plugins = self.find_plugins(args).select do |plugin|
       plugin.js_asset_exists?
-    end.map { |plugin| "plugins/#{plugin.directory_name}" }
+    end
+
+    plugins = plugins.select do |plugin|
+      plugin.asset_filters.all? { |b| b.call(:js, args[:request]) }
+    end
+
+    plugins.map { |plugin| "plugins/#{plugin.directory_name}" }
   end
 
   def self.assets_digest
@@ -280,7 +328,6 @@ module Discourse
     Auth::AuthProvider.new(authenticator: Auth::GoogleOAuth2Authenticator.new, frame_width: 850, frame_height: 500), # Custom icon implemented in client
     Auth::AuthProvider.new(authenticator: Auth::GithubAuthenticator.new, icon: "fab-github"),
     Auth::AuthProvider.new(authenticator: Auth::TwitterAuthenticator.new, icon: "fab-twitter"),
-    Auth::AuthProvider.new(authenticator: Auth::InstagramAuthenticator.new, icon: "fab-instagram"),
     Auth::AuthProvider.new(authenticator: Auth::DiscordAuthenticator.new, icon: "fab-discord")
   ]
 
@@ -335,8 +382,13 @@ module Discourse
     SiteSetting.force_hostname.presence || RailsMultisite::ConnectionManagement.current_hostname
   end
 
-  def self.base_uri(default_value = "")
+  def self.base_path(default_value = "")
     ActionController::Base.config.relative_url_root.presence || default_value
+  end
+
+  def self.base_uri(default_value = "")
+    deprecate("Discourse.base_uri is deprecated, use Discourse.base_path instead")
+    base_path(default_value)
   end
 
   def self.base_protocol
@@ -356,22 +408,22 @@ module Discourse
   end
 
   def self.base_url
-    base_url_no_prefix + base_uri
+    base_url_no_prefix + base_path
   end
 
   def self.route_for(uri)
     unless uri.is_a?(URI)
       uri = begin
         URI(uri)
-      rescue URI::Error
+      rescue ArgumentError, URI::Error
       end
     end
 
     return unless uri
 
     path = +(uri.path || "")
-    if !uri.host || (uri.host == Discourse.current_hostname && path.start_with?(Discourse.base_uri))
-      path.slice!(Discourse.base_uri)
+    if !uri.host || (uri.host == Discourse.current_hostname && path.start_with?(Discourse.base_path))
+      path.slice!(Discourse.base_path)
       return Rails.application.routes.recognize_path(path)
     end
 
@@ -381,36 +433,49 @@ module Discourse
   end
 
   class << self
-    alias_method :base_path, :base_uri
     alias_method :base_url_no_path, :base_url_no_prefix
   end
 
-  READONLY_MODE_KEY_TTL  ||= 60
-  READONLY_MODE_KEY      ||= 'readonly_mode'
-  PG_READONLY_MODE_KEY   ||= 'readonly_mode:postgres'
-  USER_READONLY_MODE_KEY ||= 'readonly_mode:user'
+  READONLY_MODE_KEY_TTL      ||= 60
+  READONLY_MODE_KEY          ||= 'readonly_mode'
+  PG_READONLY_MODE_KEY       ||= 'readonly_mode:postgres'
+  PG_READONLY_MODE_KEY_TTL   ||= 300
+  USER_READONLY_MODE_KEY     ||= 'readonly_mode:user'
+  PG_FORCE_READONLY_MODE_KEY ||= 'readonly_mode:postgres_force'
 
   READONLY_KEYS ||= [
     READONLY_MODE_KEY,
     PG_READONLY_MODE_KEY,
-    USER_READONLY_MODE_KEY
+    USER_READONLY_MODE_KEY,
+    PG_FORCE_READONLY_MODE_KEY
   ]
 
   def self.enable_readonly_mode(key = READONLY_MODE_KEY)
-    if key == USER_READONLY_MODE_KEY
+    if key == PG_READONLY_MODE_KEY || key == PG_FORCE_READONLY_MODE_KEY
+      Sidekiq.pause!("pg_failover") if !Sidekiq.paused?
+    end
+
+    if key == USER_READONLY_MODE_KEY || key == PG_FORCE_READONLY_MODE_KEY
       Discourse.redis.set(key, 1)
     else
-      Discourse.redis.setex(key, READONLY_MODE_KEY_TTL, 1)
-      keep_readonly_mode(key) if !Rails.env.test?
+      ttl =
+        case key
+        when PG_READONLY_MODE_KEY
+          PG_READONLY_MODE_KEY_TTL
+        else
+          READONLY_MODE_KEY_TTL
+        end
+
+      Discourse.redis.setex(key, ttl, 1)
+      keep_readonly_mode(key, ttl: ttl) if !Rails.env.test?
     end
 
     MessageBus.publish(readonly_channel, true)
-    Site.clear_anon_cache!
     true
   end
 
-  def self.keep_readonly_mode(key)
-    # extend the expiry by 1 minute every 30 seconds
+  def self.keep_readonly_mode(key, ttl:)
+    # extend the expiry by ttl minute every ttl/2 seconds
     @mutex ||= Mutex.new
 
     @mutex.synchronize do
@@ -421,12 +486,12 @@ module Discourse
       unless @threads[key]&.alive?
         @threads[key] = Thread.new do
           while @dbs.size > 0 do
-            sleep 30
+            sleep ttl / 2
 
             @mutex.synchronize do
               @dbs.each do |db|
                 RailsMultisite::ConnectionManagement.with_connection(db) do
-                  if !Discourse.redis.expire(key, READONLY_MODE_KEY_TTL)
+                  if !Discourse.redis.expire(key, ttl)
                     @dbs.delete(db)
                   end
                 end
@@ -439,14 +504,33 @@ module Discourse
   end
 
   def self.disable_readonly_mode(key = READONLY_MODE_KEY)
+    if key == PG_READONLY_MODE_KEY || key == PG_FORCE_READONLY_MODE_KEY
+      Sidekiq.unpause! if Sidekiq.paused?
+    end
+
     Discourse.redis.del(key)
     MessageBus.publish(readonly_channel, false)
-    Site.clear_anon_cache!
+    true
+  end
+
+  def self.enable_pg_force_readonly_mode
+    RailsMultisite::ConnectionManagement.each_connection do
+      enable_readonly_mode(PG_FORCE_READONLY_MODE_KEY)
+    end
+
+    true
+  end
+
+  def self.disable_pg_force_readonly_mode
+    RailsMultisite::ConnectionManagement.each_connection do
+      disable_readonly_mode(PG_FORCE_READONLY_MODE_KEY)
+    end
+
     true
   end
 
   def self.readonly_mode?(keys = READONLY_KEYS)
-    recently_readonly? || Discourse.redis.mget(*keys).compact.present?
+    recently_readonly? || Discourse.redis.exists?(*keys)
   end
 
   def self.pg_readonly_mode?
@@ -475,12 +559,21 @@ module Discourse
     postgres_last_read_only[Discourse.redis.namespace] = Time.zone.now
   end
 
+  def self.clear_postgres_readonly!
+    postgres_last_read_only[Discourse.redis.namespace] = nil
+  end
+
   def self.received_redis_readonly!
     redis_last_read_only[Discourse.redis.namespace] = Time.zone.now
   end
 
+  def self.clear_redis_readonly!
+    redis_last_read_only[Discourse.redis.namespace] = nil
+  end
+
   def self.clear_readonly!
-    postgres_last_read_only[Discourse.redis.namespace] = redis_last_read_only[Discourse.redis.namespace] = nil
+    clear_redis_readonly!
+    clear_postgres_readonly!
     Site.clear_anon_cache!
     true
   end
@@ -609,20 +702,19 @@ module Discourse
     # note: some of this reconnecting may no longer be needed per https://github.com/redis/redis-rb/pull/414
     MessageBus.after_fork
     SiteSetting.after_fork
-    Discourse.redis._client.reconnect
+    Discourse.redis.reconnect
     Rails.cache.reconnect
     Discourse.cache.reconnect
     Logster.store.redis.reconnect
     # shuts down all connections in the pool
-    Sidekiq.redis_pool.shutdown { |c| nil }
+    Sidekiq.redis_pool.shutdown { |conn| conn.disconnect!  }
     # re-establish
     Sidekiq.redis = sidekiq_redis_config
-    start_connection_reaper
 
     # in case v8 was initialized we want to make sure it is nil
     PrettyText.reset_context
 
-    Tilt::ES6ModuleTranspilerTemplate.reset_context if defined? Tilt::ES6ModuleTranspilerTemplate
+    DiscourseJsProcessor::Transpiler.reset_context if defined? DiscourseJsProcessor::Transpiler
     JsLocaleHelper.reset_context if defined? JsLocaleHelper
     nil
   end
@@ -694,44 +786,10 @@ module Discourse
       )
     else
       # no logster ... fallback
-      Rails.logger.warn("#{message} #{e}")
+      Rails.logger.warn("#{message} #{e}\n#{e.backtrace.join("\n")}")
     end
   rescue
     STDERR.puts "Failed to report exception #{e} #{message}"
-  end
-
-  def self.start_connection_reaper
-    return if GlobalSetting.connection_reaper_age < 1 ||
-              GlobalSetting.connection_reaper_interval < 1
-
-    # this helps keep connection counts in check
-    Thread.new do
-      while true
-        begin
-          sleep GlobalSetting.connection_reaper_interval
-          reap_connections(GlobalSetting.connection_reaper_age)
-        rescue => e
-          Discourse.warn_exception(e, message: "Error reaping connections")
-        end
-      end
-    end
-  end
-
-  def self.reap_connections(idle)
-    pools = []
-    ObjectSpace.each_object(ActiveRecord::ConnectionAdapters::ConnectionPool) { |pool| pools << pool }
-
-    pools.each do |pool|
-      # reap recovers connections that were aborted
-      # eg a thread died or a dev forgot to check it in
-      # flush removes idle connections
-      # after fork we have "deadpools" so ignore them, they have been discarded
-      # so @connections is set to nil
-      if pool.connections
-        pool.reap
-        pool.flush(idle)
-      end
-    end
   end
 
   def self.deprecate(warning, drop_from: nil, since: nil, raise_error: false, output_in_test: false)
@@ -768,7 +826,7 @@ module Discourse
     warning
   end
 
-  SIDEKIQ_NAMESPACE ||= 'sidekiq'.freeze
+  SIDEKIQ_NAMESPACE ||= 'sidekiq'
 
   def self.sidekiq_redis_config
     conf = GlobalSetting.redis_config.dup
@@ -826,7 +884,7 @@ module Discourse
 
     # load up schema cache for all multisite assuming all dbs have
     # an identical schema
-    RailsMultisite::ConnectionManagement.each_connection do
+    RailsMultisite::ConnectionManagement.safe_each_connection do
       dup_cache = schema_cache.dup
       # this line is not really needed, but just in case the
       # underlying implementation changes lets give it a shot
@@ -859,6 +917,24 @@ module Discourse
 
   def self.is_parallel_test?
     ENV['RAILS_ENV'] == "test" && ENV['TEST_ENV_NUMBER']
+  end
+
+  CDN_REQUEST_METHODS ||= ["GET", "HEAD", "OPTIONS"]
+
+  def self.is_cdn_request?(env, request_method)
+    return unless CDN_REQUEST_METHODS.include?(request_method)
+
+    cdn_hostnames = GlobalSetting.cdn_hostnames
+    return if cdn_hostnames.blank?
+
+    requested_hostname = env[REQUESTED_HOSTNAME] || env[Rack::HTTP_HOST]
+    cdn_hostnames.include?(requested_hostname)
+  end
+
+  def self.apply_cdn_headers(headers)
+    headers['Access-Control-Allow-Origin'] = '*'
+    headers['Access-Control-Allow-Methods'] = CDN_REQUEST_METHODS.join(", ")
+    headers
   end
 end
 

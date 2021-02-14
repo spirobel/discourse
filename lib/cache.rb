@@ -22,6 +22,8 @@ class Cache
   # pointless data
   MAX_CACHE_AGE = 1.day unless defined? MAX_CACHE_AGE
 
+  attr_reader :namespace
+
   # we don't need this feature, 1 day expiry is enough
   # it makes lookups a tad cheaper
   def self.supports_cache_versioning?
@@ -56,7 +58,7 @@ class Cache
 
   def exist?(name)
     key = normalize_key(name)
-    redis.exists(key)
+    redis.exists?(key)
   end
 
   # this removes a bunch of stuff we do not need like instrumentation and versioning
@@ -66,7 +68,7 @@ class Cache
   end
 
   def write(name, value, expires_in: nil)
-    write_entry(normalize_key(name), value, expires_in: nil)
+    write_entry(normalize_key(name), value, expires_in: expires_in)
   end
 
   def delete(name)

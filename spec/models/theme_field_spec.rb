@@ -8,6 +8,10 @@ describe ThemeField do
     ThemeField.destroy_all
   end
 
+  before do
+    I18n.locale = :en
+  end
+
   describe "scope: find_by_theme_ids" do
     it "returns result in the specified order" do
       theme = Fabricate(:theme)
@@ -60,22 +64,22 @@ describe ThemeField do
 
   it 'only extracts inline javascript to an external file' do
     html = <<~HTML
-    <script type="text/discourse-plugin" version="0.8">
-      var a = "inline discourse plugin";
-    </script>
-    <script type="text/template" data-template="custom-template">
-      <div>custom script type</div>
-    </script>
-    <script>
-      var b = "inline raw script";
-    </script>
-    <script type="texT/jAvasCripT">
-      var c = "text/javascript";
-    </script>
-    <script type="application/javascript">
-      var d = "application/javascript";
-    </script>
-    <script src="/external-script.js"></script>
+      <script type="text/discourse-plugin" version="0.8">
+        var a = "inline discourse plugin";
+      </script>
+      <script type="text/template" data-template="custom-template">
+        <div>custom script type</div>
+      </script>
+      <script>
+        var b = "inline raw script";
+      </script>
+      <script type="texT/jAvasCripT">
+        var c = "text/javascript";
+      </script>
+      <script type="application/javascript">
+        var d = "application/javascript";
+      </script>
+      <script src="/external-script.js"></script>
     HTML
 
     theme_field = ThemeField.create!(theme_id: 1, target_id: 0, name: "header", value: html)
@@ -91,13 +95,13 @@ describe ThemeField do
 
   it 'adds newlines between the extracted javascripts' do
     html = <<~HTML
-    <script>var a = 10</script>
-    <script>var b = 10</script>
+      <script>var a = 10</script>
+      <script>var b = 10</script>
     HTML
 
     extracted = <<~JavaScript
-    var a = 10
-    var b = 10
+      var a = 10
+      var b = 10
     JavaScript
 
     theme_field = ThemeField.create!(theme_id: 1, target_id: 0, name: "header", value: html)
@@ -146,20 +150,26 @@ HTML
     field = ThemeField.create!(theme_id: 1, target_id: 0, name: "scss", value: css)
     field.ensure_baked!
     expect(field.error).not_to eq(nil)
+
+    field.value = "@import 'missingfile';"
+    field.save!
+    field.ensure_baked!
+    expect(field.error).to include("File to import not found or unreadable: missingfile.scss.")
+
     field.value = "body {color: blue};"
     field.save!
     field.ensure_baked!
-
     expect(field.error).to eq(nil)
   end
 
   it "allows importing scss files" do
     theme = Fabricate(:theme)
-    main_field = theme.set_field(target: :common, name: :scss, value: ".class1{color: red}\n@import 'rootfile1';")
+    main_field = theme.set_field(target: :common, name: :scss, value: ".class1{color: red}\n@import 'rootfile1';\n@import 'rootfile3';")
     theme.set_field(target: :extra_scss, name: "rootfile1", value: ".class2{color:green}\n@import 'foldername/subfile1';")
     theme.set_field(target: :extra_scss, name: "rootfile2", value: ".class3{color:green} ")
     theme.set_field(target: :extra_scss, name: "foldername/subfile1", value: ".class4{color:yellow}\n@import 'subfile2';")
     theme.set_field(target: :extra_scss, name: "foldername/subfile2", value: ".class5{color:yellow}\n@import '../rootfile2';")
+    theme.set_field(target: :extra_scss, name: "rootfile3", value: ".class6{color:green} ")
 
     theme.save!
     result = main_field.compile_scss[0]
@@ -169,11 +179,13 @@ HTML
     expect(result).to include(".class3")
     expect(result).to include(".class4")
     expect(result).to include(".class5")
+    expect(result).to include(".class6")
   end
 
   it "correctly handles extra JS fields" do
     theme = Fabricate(:theme)
-    js_field = theme.set_field(target: :extra_js, name: "discourse/controllers/discovery.js.es6", value: "import 'discourse/lib/ajax'; console.log('hello');")
+    js_field = theme.set_field(target: :extra_js, name: "discourse/controllers/discovery.js.es6", value: "import 'discourse/lib/ajax'; console.log('hello from .js.es6');")
+    js_2_field = theme.set_field(target: :extra_js, name: "discourse/controllers/discovery-2.js", value: "import 'discourse/lib/ajax'; console.log('hello from .js');")
     hbs_field = theme.set_field(target: :extra_js, name: "discourse/templates/discovery.hbs", value: "{{hello-world}}")
     raw_hbs_field = theme.set_field(target: :extra_js, name: "discourse/templates/discovery.hbr", value: "{{hello-world}}")
     hbr_field = theme.set_field(target: :extra_js, name: "discourse/templates/other_discovery.hbr", value: "{{hello-world}}")
@@ -181,29 +193,33 @@ HTML
     theme.save!
 
     expected_js = <<~JS
-      define("discourse/controllers/discovery", ["discourse/lib/ajax"], function () {
+      define("discourse/controllers/discovery", ["discourse/lib/ajax"], function (_ajax) {
         "use strict";
 
         var __theme_name__ = "#{theme.name}";
+
         var settings = Discourse.__container__.lookup("service:theme-settings").getObjectForTheme(#{theme.id});
+
         var themePrefix = function themePrefix(key) {
-          return "theme_translations.#{theme.id}." + key;
+          return "theme_translations.#{theme.id}.".concat(key);
         };
-        console.log('hello');
+
+        console.log('hello from .js.es6');
       });
     JS
     expect(js_field.reload.value_baked).to eq(expected_js.strip)
 
     expect(hbs_field.reload.value_baked).to include('Ember.TEMPLATES["discovery"]')
-    expect(raw_hbs_field.reload.value_baked).to include('Discourse.RAW_TEMPLATES["discovery"]')
-    expect(hbr_field.reload.value_baked).to include('Discourse.RAW_TEMPLATES["other_discovery"]')
+    expect(raw_hbs_field.reload.value_baked).to include('addRawTemplate("discovery"')
+    expect(hbr_field.reload.value_baked).to include('addRawTemplate("other_discovery"')
     expect(unknown_field.reload.value_baked).to eq("")
     expect(unknown_field.reload.error).to eq(I18n.t("themes.compile_error.unrecognized_extension", extension: "blah"))
 
     # All together
     expect(theme.javascript_cache.content).to include('Ember.TEMPLATES["discovery"]')
-    expect(theme.javascript_cache.content).to include('Discourse.RAW_TEMPLATES["discovery"]')
+    expect(theme.javascript_cache.content).to include('addRawTemplate("discovery"')
     expect(theme.javascript_cache.content).to include('define("discourse/controllers/discovery"')
+    expect(theme.javascript_cache.content).to include('define("discourse/controllers/discovery-2"')
     expect(theme.javascript_cache.content).to include("var settings =")
   end
 
@@ -299,8 +315,8 @@ HTML
     let!(:theme3) { Fabricate(:theme) }
 
     let!(:en1) {
-      ThemeField.create!(theme: theme, target_id: Theme.targets[:translations], name: "en_US",
-                         value: { en_US: { somestring1: "helloworld", group: { key1: "enval1" } } }
+      ThemeField.create!(theme: theme, target_id: Theme.targets[:translations], name: "en",
+                         value: { en: { somestring1: "helloworld", group: { key1: "enval1" } } }
                                   .deep_stringify_keys.to_yaml
       )
     }
@@ -311,21 +327,21 @@ HTML
       )
     }
     let!(:fr2) { ThemeField.create!(theme: theme2, target_id: Theme.targets[:translations], name: "fr", value: "") }
-    let!(:en2) { ThemeField.create!(theme: theme2, target_id: Theme.targets[:translations], name: "en_US", value: "") }
+    let!(:en2) { ThemeField.create!(theme: theme2, target_id: Theme.targets[:translations], name: "en", value: "") }
     let!(:ca3) { ThemeField.create!(theme: theme3, target_id: Theme.targets[:translations], name: "ca", value: "") }
-    let!(:en3) { ThemeField.create!(theme: theme3, target_id: Theme.targets[:translations], name: "en_US", value: "") }
+    let!(:en3) { ThemeField.create!(theme: theme3, target_id: Theme.targets[:translations], name: "en", value: "") }
 
     describe "scopes" do
       it "filter_locale_fields returns results in the correct order" do
         expect(ThemeField.find_by_theme_ids([theme3.id, theme.id, theme2.id])
           .filter_locale_fields(
-           ["en_US", "fr"]
+           ["en", "fr"]
         )).to eq([en3, en1, fr1, en2, fr2])
       end
 
       it "find_first_locale_fields returns only the first locale for each theme" do
         expect(ThemeField.find_first_locale_fields(
-          [theme3.id, theme.id, theme2.id], ["ca", "en_US", "fr"]
+          [theme3.id, theme.id, theme2.id], ["ca", "en", "fr"]
         )).to eq([ca3, en1, en2])
       end
     end
@@ -356,7 +372,7 @@ HTML
       it "loads correctly" do
         expect(fr1.translation_data).to eq(
           fr: { somestring1: "bonjourworld", group: { key2: "frval2" } },
-          en_US: { somestring1: "helloworld", group: { key1: "enval1" } }
+          en: { somestring1: "helloworld", group: { key1: "enval1" } }
         )
       end
 
@@ -378,7 +394,7 @@ HTML
         theme.reload
         expect(fr1.translation_data).to eq(
           fr: { somestring1: "bonjourworld", group: { key2: "frval2" } },
-          en_US: { somestring1: "helloworld", group: { key1: "overriddentest1" } }
+          en: { somestring1: "helloworld", group: { key1: "overriddentest1" } }
         )
       end
     end
@@ -396,9 +412,9 @@ HTML
     describe "prefix injection" do
       it "injects into JS" do
         html = <<~HTML
-        <script type="text/discourse-plugin" version="0.8">
-          var a = "inline discourse plugin";
-        </script>
+          <script type="text/discourse-plugin" version="0.8">
+            var a = "inline discourse plugin";
+          </script>
         HTML
 
         theme_field = ThemeField.create!(theme_id: theme.id, target_id: 0, name: "head_tag", value: html)
@@ -407,6 +423,17 @@ HTML
         expect(javascript_cache.content).to include("inline discourse plugin")
         expect(javascript_cache.content).to include("theme_translations.#{theme.id}.")
       end
+    end
+  end
+
+  context "SVG sprite theme fields" do
+    let(:upload) { Fabricate(:upload) }
+    let(:theme) { Fabricate(:theme) }
+    let(:theme_field) { ThemeField.create!(theme: theme, target_id: 0, name: SvgSprite.theme_sprite_variable_name, upload: upload, value: "", value_baked: "baked", type_id: ThemeField.types[:theme_upload_var]) }
+
+    it "is rebaked when upload changes" do
+      theme_field.update(upload: Fabricate(:upload))
+      expect(theme_field.value_baked).to eq(nil)
     end
   end
 

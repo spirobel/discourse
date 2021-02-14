@@ -47,15 +47,20 @@ class PostSerializer < BasicPostSerializer
              :link_counts,
              :read,
              :user_title,
+             :title_is_group,
              :reply_to_user,
              :bookmarked,
-             :bookmarked_with_reminder,
              :bookmark_reminder_at,
+             :bookmark_id,
+             :bookmark_reminder_type,
+             :bookmark_name,
+             :bookmark_auto_delete_preference,
              :raw,
              :actions_summary,
              :moderator?,
              :admin?,
              :staff?,
+             :group_moderator,
              :user_id,
              :draft_sequence,
              :hidden,
@@ -73,8 +78,7 @@ class PostSerializer < BasicPostSerializer
              :is_auto_generated,
              :action_code,
              :action_code_who,
-             :notice_type,
-             :notice_args,
+             :notice,
              :last_wiki_edit,
              :locked,
              :excerpt,
@@ -134,6 +138,20 @@ class PostSerializer < BasicPostSerializer
 
   def staff?
     !!(object&.user&.staff?)
+  end
+
+  def group_moderator
+    !!@group_moderator
+  end
+
+  def include_group_moderator?
+    @group_moderator ||= begin
+      if @topic_view
+        @topic_view.category_group_moderator_user_ids.include?(object.user_id)
+      else
+        object&.user&.guardian&.is_category_group_moderator?(object&.topic&.category)
+      end
+    end
   end
 
   def yours
@@ -207,6 +225,14 @@ class PostSerializer < BasicPostSerializer
 
   def user_title
     object&.user&.title
+  end
+
+  def title_is_group
+    object&.user&.title == object.user&.primary_group&.title
+  end
+
+  def include_title_is_group?
+    object&.user&.title.present?
   end
 
   def trust_level
@@ -307,35 +333,54 @@ class PostSerializer < BasicPostSerializer
     !(SiteSetting.suppress_reply_when_quoting && object.reply_quoted?) && object.reply_to_user
   end
 
-  # this atrtribute is not even included unless include_bookmarked? is true,
-  # which is why it is always true if included
   def bookmarked
-    true
-  end
-
-  def bookmarked_with_reminder
-    true
-  end
-
-  def include_bookmarked?
-    (actions.present? && actions.keys.include?(PostActionType.types[:bookmark]))
-  end
-
-  def include_bookmarked_with_reminder?
-    post_bookmark.present?
+    @bookmarked ||= post_bookmark.present?
   end
 
   def include_bookmark_reminder_at?
-    include_bookmarked_with_reminder?
+    bookmarked
+  end
+
+  def include_bookmark_reminder_type?
+    bookmarked
+  end
+
+  def include_bookmark_name?
+    bookmarked
+  end
+
+  def include_bookmark_auto_delete_preference?
+    bookmarked
+  end
+
+  def include_bookmark_id?
+    bookmarked
   end
 
   def post_bookmark
-    return nil if !SiteSetting.enable_bookmarks_with_reminders? || @topic_view.blank?
+    return nil if @topic_view.blank?
     @post_bookmark ||= @topic_view.user_post_bookmarks.find { |bookmark| bookmark.post_id == object.id }
   end
 
   def bookmark_reminder_at
     post_bookmark&.reminder_at
+  end
+
+  def bookmark_reminder_type
+    return if post_bookmark.blank?
+    Bookmark.reminder_types[post_bookmark.reminder_type].to_s
+  end
+
+  def bookmark_name
+    post_bookmark&.name
+  end
+
+  def bookmark_auto_delete_preference
+    post_bookmark&.auto_delete_preference
+  end
+
+  def bookmark_id
+    post_bookmark&.id
   end
 
   def include_display_username?
@@ -392,12 +437,14 @@ class PostSerializer < BasicPostSerializer
     include_action_code? && action_code_who.present?
   end
 
-  def notice_type
-    post_custom_fields[Post::NOTICE_TYPE]
+  def notice
+    post_custom_fields[Post::NOTICE]
   end
 
-  def include_notice_type?
-    case notice_type
+  def include_notice?
+    return false if notice.blank?
+
+    case notice["type"]
     when Post.notices[:custom]
       return true
     when Post.notices[:new_user]
@@ -408,17 +455,7 @@ class PostSerializer < BasicPostSerializer
       return false
     end
 
-    scope.user && scope.user.id && object.user &&
-    scope.user.id != object.user_id &&
-    scope.user.has_trust_level?(min_trust_level)
-  end
-
-  def notice_args
-    post_custom_fields[Post::NOTICE_ARGS]
-  end
-
-  def include_notice_args?
-    notice_args.present? && include_notice_type?
+    scope.user && scope.user.id != object.user_id && scope.user.has_trust_level?(min_trust_level)
   end
 
   def locked

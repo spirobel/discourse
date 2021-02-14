@@ -9,5 +9,17 @@
         }
       }
     }
+
+    .category-row {
+      max-width: 100%;
+
+      .topic-count {
+        margin-left: 0.25em;
+      }
+
+      .plus-subcategories {
+        font-size: $font-down-2;
+      }
+    }
   }
 }

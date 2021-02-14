@@ -67,7 +67,7 @@ RSpec.describe ReviewableUser, type: :model do
       end
 
       it "allows us to reject a user" do
-        result = reviewable.perform(moderator, :reject_user_delete)
+        result = reviewable.perform(moderator, :reject_user_delete, reject_reason: "reject reason")
         expect(result.success?).to eq(true)
 
         expect(reviewable.pending?).to eq(false)
@@ -76,13 +76,14 @@ RSpec.describe ReviewableUser, type: :model do
         # Rejecting deletes the user record
         reviewable.reload
         expect(reviewable.target).to be_blank
+        expect(reviewable.reject_reason).to eq("reject reason")
       end
 
       it "allows us to reject and block a user" do
         email = reviewable.target.email
         ip = reviewable.target.ip_address
 
-        result = reviewable.perform(moderator, :reject_user_block)
+        result = reviewable.perform(moderator, :reject_user_block, reject_reason: "reject reason")
         expect(result.success?).to eq(true)
 
         expect(reviewable.pending?).to eq(false)
@@ -91,9 +92,22 @@ RSpec.describe ReviewableUser, type: :model do
         # Rejecting deletes the user record
         reviewable.reload
         expect(reviewable.target).to be_blank
+        expect(reviewable.reject_reason).to eq("reject reason")
 
         expect(ScreenedEmail.should_block?(email)).to eq(true)
         expect(ScreenedIpAddress.should_block?(ip)).to eq(true)
+      end
+
+      it "is not sending email to the user about rejection" do
+        SiteSetting.must_approve_users = true
+        Jobs::CriticalUserEmail.any_instance.expects(:execute).never
+        reviewable.perform(moderator, :reject_user_block, reject_reason: "reject reason", send_email: false)
+      end
+
+      it "optionaly sends email with reject reason" do
+        SiteSetting.must_approve_users = true
+        Jobs::CriticalUserEmail.any_instance.expects(:execute).with(type: :signup_after_reject, user_id: reviewable.target_id, reject_reason: "reject reason").once
+        reviewable.perform(moderator, :reject_user_block, reject_reason: "reject reason", send_email: true)
       end
 
       it "allows us to reject a user who has posts" do
@@ -134,38 +148,27 @@ RSpec.describe ReviewableUser, type: :model do
     before do
       SiteSetting.must_approve_users = true
       Jobs.run_immediately!
+      @reviewable = ReviewableUser.find_by(target: user)
+      Jobs.run_later!
     end
 
     it "creates the ReviewableUser for a user, with moderator access" do
-      reviewable = ReviewableUser.find_by(target: user)
-      expect(reviewable).to be_present
-      expect(reviewable.reviewable_by_moderator).to eq(true)
+      expect(@reviewable.reviewable_by_moderator).to eq(true)
     end
 
     context "email jobs" do
-      let(:reviewable) { ReviewableUser.find_by(target: user) }
-      before do
-        reviewable
-
-        # We can ignore these notifications for the purpose of this test
-        Jobs.stubs(:enqueue).with(:notify_reviewable, has_key(:reviewable_id))
-      end
-
-      after do
-        ReviewableUser.find_by(target: user).perform(admin, :approve_user)
-      end
-
       it "enqueues a 'signup after approval' email if must_approve_users is true" do
-        Jobs.expects(:enqueue).with(
-          :critical_user_email, has_entries(type: :signup_after_approval)
-        )
+        expect_enqueued_with(job: :critical_user_email, args: { type: :signup_after_approval }) do
+          @reviewable.perform(admin, :approve_user)
+        end
       end
 
       it "doesn't enqueue a 'signup after approval' email if must_approve_users is false" do
         SiteSetting.must_approve_users = false
-        Jobs.expects(:enqueue).with(
-          :critical_user_email, has_entries(type: :signup_after_approval)
-        ).never
+
+        expect_not_enqueued_with(job: :critical_user_email, args: { type: :signup_after_approval }) do
+          @reviewable.perform(admin, :approve_user)
+        end
       end
     end
 

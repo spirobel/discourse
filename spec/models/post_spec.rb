@@ -136,24 +136,18 @@ describe Post do
         end
       end
     end
+  end
 
-    context 'a post with notices' do
-      let(:post) {
-        post = Fabricate(:post, post_args)
-        post.custom_fields[Post::NOTICE_TYPE] = Post.notices[:returning_user]
-        post.custom_fields[Post::NOTICE_ARGS] = 1.day.ago
-        post.save_custom_fields
-        post
-      }
-
-      describe 'recovery' do
-        it 'deletes notices' do
-          expect { post.trash! }
-            .to change { post.custom_fields.length }.from(2).to(0)
-        end
-      end
+  context 'a post with notices' do
+    let(:post) do
+      post = Fabricate(:post, post_args)
+      post.upsert_custom_fields(Post::NOTICE => { type: Post.notices[:returning_user], last_posted_at: 1.day.ago })
+      post
     end
 
+    it 'will have its notice cleared when post is trashed' do
+      expect { post.trash! }.to change { post.custom_fields }.to({})
+    end
   end
 
   describe "with_secure_media?" do
@@ -164,7 +158,11 @@ describe Post do
     end
 
     context "when secure media is enabled" do
-      before { enable_secure_media_and_s3 }
+      before do
+        setup_s3
+        SiteSetting.authorized_extensions = "pdf|png|jpg|csv"
+        SiteSetting.secure_media = true
+      end
 
       context "if login_required" do
         before { SiteSetting.login_required = true }
@@ -237,7 +235,7 @@ describe Post do
     end
   end
 
-  describe "maximum images" do
+  describe "maximum media embeds" do
     fab!(:newuser) { Fabricate(:user, trust_level: TrustLevel[0]) }
     let(:post_no_images) { Fabricate.build(:post, post_args.merge(user: newuser)) }
     let(:post_one_image) { post_with_body("![sherlock](http://bbc.co.uk/sherlock.jpg)", newuser) }
@@ -249,78 +247,83 @@ describe Post do
     let(:post_image_within_pre) { post_with_body('<pre><img src="coolimage.png"></pre>', newuser) }
     let(:post_with_thumbnail) { post_with_body('<img src="/assets/emoji/smiley.png" class="thumbnail">', newuser) }
     let(:post_with_two_classy_images) { post_with_body("<img src='http://discourse.org/logo.png' class='classy'> <img src='http://bbc.co.uk/sherlock.jpg' class='classy'>", newuser) }
+    let(:post_with_two_embedded_media) { post_with_body('<video width="950" height="700" controls><source src="https://bbc.co.uk/news.mp4" type="video/mp4"></video><audio controls><source type="audio/mpeg" src="https://example.com/audio.mp3"></audio>', newuser) }
 
     it "returns 0 images for an empty post" do
-      expect(Fabricate.build(:post).image_count).to eq(0)
+      expect(Fabricate.build(:post).embedded_media_count).to eq(0)
     end
 
     it "finds images from markdown" do
-      expect(post_one_image.image_count).to eq(1)
+      expect(post_one_image.embedded_media_count).to eq(1)
     end
 
     it "finds images from HTML" do
-      expect(post_two_images.image_count).to eq(2)
+      expect(post_two_images.embedded_media_count).to eq(2)
     end
 
     it "doesn't count avatars as images" do
-      expect(post_with_avatars.image_count).to eq(0)
+      expect(post_with_avatars.embedded_media_count).to eq(0)
     end
 
     it "allows images by default" do
       expect(post_one_image).to be_valid
     end
 
-    it "doesn't allow more than `min_trust_to_post_images`" do
-      SiteSetting.min_trust_to_post_images = 4
+    it "doesn't allow more than `min_trust_to_post_embedded_media`" do
+      SiteSetting.min_trust_to_post_embedded_media = 4
       post_one_image.user.trust_level = 3
       expect(post_one_image).not_to be_valid
     end
 
-    it "doesn't allow more than `min_trust_to_post_images` in a quote" do
-      SiteSetting.min_trust_to_post_images = 4
+    it "doesn't allow more than `min_trust_to_post_embedded_media` in a quote" do
+      SiteSetting.min_trust_to_post_embedded_media = 4
       post_one_image.user.trust_level = 3
       expect(post_image_within_quote).not_to be_valid
     end
 
-    it "doesn't allow more than `min_trust_to_post_images` in code" do
-      SiteSetting.min_trust_to_post_images = 4
+    it "doesn't allow more than `min_trust_to_post_embedded_media` in code" do
+      SiteSetting.min_trust_to_post_embedded_media = 4
       post_one_image.user.trust_level = 3
       expect(post_image_within_code).not_to be_valid
     end
 
-    it "doesn't allow more than `min_trust_to_post_images` in pre" do
-      SiteSetting.min_trust_to_post_images = 4
+    it "doesn't allow more than `min_trust_to_post_embedded_media` in pre" do
+      SiteSetting.min_trust_to_post_embedded_media = 4
       post_one_image.user.trust_level = 3
       expect(post_image_within_pre).not_to be_valid
     end
 
-    it "doesn't allow more than `min_trust_to_post_images`" do
-      SiteSetting.min_trust_to_post_images = 4
+    it "doesn't allow more than `min_trust_to_post_embedded_media`" do
+      SiteSetting.min_trust_to_post_embedded_media = 4
       post_one_image.user.trust_level = 4
       expect(post_one_image).to be_valid
     end
 
     it "doesn't count favicons as images" do
       PrettyText.stubs(:cook).returns(post_with_favicon.raw)
-      expect(post_with_favicon.image_count).to eq(0)
+      expect(post_with_favicon.embedded_media_count).to eq(0)
     end
 
     it "doesn't count thumbnails as images" do
       PrettyText.stubs(:cook).returns(post_with_thumbnail.raw)
-      expect(post_with_thumbnail.image_count).to eq(0)
+      expect(post_with_thumbnail.embedded_media_count).to eq(0)
     end
 
-    it "doesn't count whitelisted images" do
-      Post.stubs(:white_listed_image_classes).returns(["classy"])
-      # I dislike this, but passing in a custom whitelist is hard
+    it "doesn't count allowlisted images" do
+      Post.stubs(:allowed_image_classes).returns(["classy"])
+      # I dislike this, but passing in a custom allowlist is hard
       PrettyText.stubs(:cook).returns(post_with_two_classy_images.raw)
-      expect(post_with_two_classy_images.image_count).to eq(0)
+      expect(post_with_two_classy_images.embedded_media_count).to eq(0)
+    end
+
+    it "counts video and audio as embedded media" do
+      expect(post_with_two_embedded_media.embedded_media_count).to eq(2)
     end
 
     context "validation" do
 
       before do
-        SiteSetting.newuser_max_images = 1
+        SiteSetting.newuser_max_embedded_media = 1
       end
 
       context 'newuser' do
@@ -328,8 +331,12 @@ describe Post do
           expect(post_one_image).to be_valid
         end
 
-        it "doesn't allow more than the maximum" do
+        it "doesn't allow more than the maximum number of images" do
           expect(post_two_images).not_to be_valid
+        end
+
+        it "doesn't allow more than the maximum number of embedded media items" do
+          expect(post_with_two_embedded_media).not_to be_valid
         end
 
         it "doesn't allow a new user to edit their post to insert an image" do
@@ -527,8 +534,8 @@ describe Post do
           expect(post_one_link).not_to be_valid
         end
 
-        it "will skip the check for whitelisted domains" do
-          SiteSetting.whitelisted_link_domains = 'www.bbc.co.uk'
+        it "will skip the check for allowlisted domains" do
+          SiteSetting.allowed_link_domains = 'www.bbc.co.uk'
           SiteSetting.min_trust_to_post_links = 2
           post_two_links.user.trust_level = TrustLevel[1]
           expect(post_one_link).to be_valid
@@ -1016,7 +1023,7 @@ describe Post do
     it "should add nofollow to links in the post for trust levels below 3" do
       post.user.trust_level = 2
       post.save
-      expect(post.cooked).to match(/nofollow noopener/)
+      expect(post.cooked).to match(/noopener nofollow ugc/)
     end
 
     it "when tl3_links_no_follow is false, should not add nofollow for trust level 3 and higher" do
@@ -1030,7 +1037,7 @@ describe Post do
       SiteSetting.tl3_links_no_follow = true
       post.user.trust_level = 3
       post.save
-      expect(post.cooked).to match(/nofollow noopener/)
+      expect(post.cooked).to match(/noopener nofollow ugc/)
     end
 
     describe 'mentions' do
@@ -1107,7 +1114,7 @@ describe Post do
 
       expect(post.has_host_spam?).to eq(true)
 
-      SiteSetting.white_listed_spam_host_domains = "bla.com|boo.com | example.net "
+      SiteSetting.allowed_spam_host_domains = "bla.com|boo.com | example.net "
       expect(post.has_host_spam?).to eq(false)
     end
 
@@ -1123,7 +1130,7 @@ describe Post do
       SiteSetting.newuser_max_links = 3
       user = Fabricate(:user, staged: true, trust_level: 0)
       user.created_at = 1.hour.ago
-      user.unstage
+      user.unstage!
       post = Fabricate(:post, raw: raw, user: user)
       expect(post.has_host_spam?).to eq(true)
     end
@@ -1132,8 +1139,8 @@ describe Post do
       SiteSetting.newuser_spam_host_threshold = 1
       SiteSetting.newuser_max_links = 3
       user = Fabricate(:user, staged: true, trust_level: 0)
-      user.created_at = 1.day.ago
-      user.unstage
+      user.created_at = 2.days.ago
+      user.unstage!
       post = Fabricate(:post, raw: raw, user: user)
       expect(post.has_host_spam?).to eq(false)
     end
@@ -1158,6 +1165,25 @@ describe Post do
     expect(post.custom_fields).to eq("Tommy" => "Hanks", "Vincent" => "Vega")
   end
 
+  describe "#excerpt_for_topic" do
+    it "returns a topic excerpt, defaulting to 220 chars" do
+      expected_excerpt = "This is a sample post with semi-long raw content. The raw content is also more than \ntwo hundred characters to satisfy any test conditions that require content longer \nthan the typical test post raw content. It really is&hellip;"
+      post = Fabricate(:post_with_long_raw_content)
+      post.rebake!
+      excerpt = post.excerpt_for_topic
+      expect(excerpt).to eq(expected_excerpt)
+    end
+
+    it "respects the site setting for topic excerpt" do
+      SiteSetting.topic_excerpt_maxlength = 10
+      expected_excerpt = "This is a &hellip;"
+      post = Fabricate(:post_with_long_raw_content)
+      post.rebake!
+      excerpt = post.excerpt_for_topic
+      expect(excerpt).to eq(expected_excerpt)
+    end
+  end
+
   describe "#rebake!" do
     it "will rebake a post correctly" do
       post = create_post
@@ -1172,9 +1198,35 @@ describe Post do
 
       result = post.rebake!
 
-      expect(post.baked_at).not_to eq(first_baked)
+      expect(post.baked_at).not_to eq_time(first_baked)
       expect(post.cooked).to eq(first_cooked)
       expect(result).to eq(true)
+    end
+
+    it "updates the topic excerpt at the same time if it is the OP" do
+      post = create_post
+      post.topic.update(excerpt: "test")
+      DB.exec("UPDATE posts SET cooked = 'frogs' WHERE id = ?", [ post.id ])
+      post.reload
+      result = post.rebake!
+      post.topic.reload
+      expect(post.topic.excerpt).not_to eq("test")
+    end
+
+    it "does not update the topic excerpt if the post is not the OP" do
+      post = create_post
+      post2 = create_post
+      post.topic.update(excerpt: "test")
+      result = post2.rebake!
+      post.topic.reload
+      expect(post.topic.excerpt).to eq("test")
+    end
+
+    it "works with posts in deleted topics" do
+      post = create_post
+      post.topic.trash!
+      post.reload
+      post.rebake!
     end
   end
 
@@ -1224,7 +1276,7 @@ describe Post do
       baked = post.baked_at
       Post.rebake_old(100)
       post.reload
-      expect(post.baked_at).to eq(baked)
+      expect(post.baked_at).to eq_time(baked)
     end
 
     it "will rate limit globally" do
@@ -1246,6 +1298,21 @@ describe Post do
       expect(post2.reload.baked_version).not_to eq(-1)
       expect(post1.reload.baked_version).to eq(-1)
 
+    end
+  end
+
+  describe ".hide!" do
+    after do
+      Discourse.redis.flushdb
+    end
+
+    it "should ignore the duplicate check" do
+      p1 = Fabricate(:post)
+      p2 = Fabricate(:post, user: p1.user)
+      SiteSetting.unique_posts_mins = 10
+      p1.store_unique_post_key
+      p2.reload.hide!(PostActionType.types[:off_topic])
+      expect(p2).to be_hidden
     end
   end
 
@@ -1305,7 +1372,7 @@ describe Post do
     fab!(:attachment_upload_2) { Fabricate(:upload) }
     fab!(:attachment_upload_3) { Fabricate(:upload, extension: nil) }
 
-    let(:base_url) { "#{Discourse.base_url_no_prefix}#{Discourse.base_uri}" }
+    let(:base_url) { "#{Discourse.base_url_no_prefix}#{Discourse.base_path}" }
     let(:video_url) { "#{base_url}#{video_upload.url}" }
     let(:audio_url) { "#{base_url}#{audio_upload.url}" }
 
@@ -1329,6 +1396,16 @@ describe Post do
     end
 
     let(:post) { Fabricate(:post, raw: raw_multiple) }
+
+    it "removes post uploads on destroy" do
+      post.link_post_uploads
+
+      post.trash!
+      expect(PostUpload.count).to eq(6)
+
+      post.destroy!
+      expect(PostUpload.count).to eq(0)
+    end
 
     context "#link_post_uploads" do
       it "finds all the uploads in the post" do
@@ -1362,7 +1439,11 @@ describe Post do
       end
 
       context "when secure media is enabled" do
-        before { enable_secure_media_and_s3 }
+        before do
+          setup_s3
+        SiteSetting.authorized_extensions = "pdf|png|jpg|csv"
+        SiteSetting.secure_media = true
+        end
 
         it "sets the access_control_post_id on uploads in the post that don't already have the value set" do
           other_post = Fabricate(:post)
@@ -1400,28 +1481,24 @@ describe Post do
       end
 
       before do
-        enable_secure_media_and_s3
+        setup_s3
+        SiteSetting.authorized_extensions = "pdf|png|jpg|csv"
+        SiteSetting.secure_media = true
+
         attachment_upload.update!(original_filename: "hello.csv")
 
-        stub_request(:head, "https://#{SiteSetting.s3_upload_bucket}.s3.amazonaws.com/")
-
-        stub_request(
-          :put,
-          "https://#{SiteSetting.s3_upload_bucket}.s3.amazonaws.com/original/1X/#{attachment_upload.sha1}.#{attachment_upload.extension}?acl"
-        )
-        stub_request(
-          :put,
-          "https://#{SiteSetting.s3_upload_bucket}.s3.amazonaws.com/original/1X/#{image_upload.sha1}.#{image_upload.extension}?acl"
-        )
+        stub_upload(attachment_upload)
+        stub_upload(image_upload)
       end
 
-      it "marks image uploads as secure in PMs when secure_media is ON" do
+      it "marks image and attachment uploads as secure in PMs when secure_media is ON" do
+        SiteSetting.secure_media = true
         post = Fabricate(:post, raw: raw, user: user, topic: Fabricate(:private_message_topic, user: user))
         post.link_post_uploads
-        post.update_uploads_secure_status
+        post.update_uploads_secure_status(source: "test")
 
         expect(PostUpload.where(post: post).joins(:upload).pluck(:upload_id, :secure)).to contain_exactly(
-          [attachment_upload.id, false],
+          [attachment_upload.id, true],
           [image_upload.id, true]
         )
       end
@@ -1430,7 +1507,7 @@ describe Post do
         SiteSetting.secure_media = false
         post = Fabricate(:post, raw: raw, user: user, topic: Fabricate(:private_message_topic, user: user))
         post.link_post_uploads
-        post.update_uploads_secure_status
+        post.update_uploads_secure_status(source: "test")
 
         expect(PostUpload.where(post: post).joins(:upload).pluck(:upload_id, :secure)).to contain_exactly(
           [attachment_upload.id, false],
@@ -1439,12 +1516,11 @@ describe Post do
       end
 
       it "marks attachments as secure when relevant setting is enabled" do
-        SiteSetting.prevent_anons_from_downloading_files = true
         SiteSetting.secure_media = true
         private_category = Fabricate(:private_category, group: Fabricate(:group))
         post = Fabricate(:post, raw: raw, user: user, topic: Fabricate(:topic, user: user, category: private_category))
         post.link_post_uploads
-        post.update_uploads_secure_status
+        post.update_uploads_secure_status(source: "test")
 
         expect(PostUpload.where(post: post).joins(:upload).pluck(:upload_id, :secure)).to contain_exactly(
           [attachment_upload.id, true],
@@ -1455,11 +1531,11 @@ describe Post do
       it "does not mark an upload as secure if it has already been used in a public topic" do
         post = Fabricate(:post, raw: raw, user: user, topic: Fabricate(:topic, user: user))
         post.link_post_uploads
-        post.update_uploads_secure_status
+        post.update_uploads_secure_status(source: "test")
 
         pm = Fabricate(:post, raw: raw, user: user, topic: Fabricate(:private_message_topic, user: user))
         pm.link_post_uploads
-        pm.update_uploads_secure_status
+        pm.update_uploads_secure_status(source: "test")
 
         expect(PostUpload.where(post: pm).joins(:upload).pluck(:upload_id, :secure)).to contain_exactly(
           [attachment_upload.id, false],
@@ -1475,10 +1551,7 @@ describe Post do
     end
 
     def updates_topic_updated_at
-
-      freeze_time 1.day.from_now
-      time = Time.now
-
+      time = freeze_time 1.day.from_now
       result = yield
 
       topic.reload
@@ -1528,6 +1601,9 @@ describe Post do
       upload2 = Fabricate(:upload)
       upload3 = Fabricate(:video_upload)
       upload4 = Fabricate(:upload)
+      upload5 = Fabricate(:upload)
+      upload6 = Fabricate(:video_upload)
+      upload7 = Fabricate(:upload, extension: "vtt")
 
       set_cdn_url "https://awesome.com/somepath"
 
@@ -1542,6 +1618,11 @@ describe Post do
       ![](http://example.com/external.png)
 
       #{Discourse.base_url}#{upload3.short_path}
+
+      <video poster="#{Discourse.base_url}#{upload5.url}">
+        <source src="#{Discourse.base_url}#{upload6.url}" type="video/mp4" />
+        <track src="#{Discourse.base_url}#{upload7.url}" label="English" kind="subtitles" srclang="en" default />
+      </video>
       RAW
 
       urls = []
@@ -1556,15 +1637,48 @@ describe Post do
         "#{GlobalSetting.cdn_url}#{upload1.url}",
         "#{GlobalSetting.cdn_url}#{upload4.url}",
         "#{Discourse.base_url}#{upload2.url}",
-        "#{Discourse.base_url}#{upload3.short_path}"
+        "#{Discourse.base_url}#{upload3.short_path}",
+        "#{Discourse.base_url}#{upload5.url}",
+        "#{Discourse.base_url}#{upload6.url}",
+        "#{Discourse.base_url}#{upload7.url}"
       )
 
       expect(paths).to contain_exactly(
         upload1.url,
         upload4.url,
         upload2.url,
-        nil
+        nil,
+        upload5.url,
+        upload6.url,
+        upload7.url
       )
+    end
+
+    it "correctly identifies secure uploads" do
+      setup_s3
+      SiteSetting.authorized_extensions = "pdf|png|jpg|csv"
+      SiteSetting.secure_media = true
+
+      upload1 = Fabricate(:upload_s3, secure: true)
+      upload2 = Fabricate(:upload_s3, secure: true)
+
+      # Test including domain:
+      upload1_url = UrlHelper.cook_url(upload1.url, secure: true)
+      # Test without domain:
+      upload2_path = URI.parse(UrlHelper.cook_url(upload2.url, secure: true)).path
+
+      post = Fabricate(:post, raw: <<~RAW)
+       <img src="#{upload1_url}"/>
+       <img src="#{upload2_path}"/>
+      RAW
+
+      sha1s = []
+
+      post.each_upload_url do |src, path, sha|
+        sha1s << sha
+      end
+
+      expect(sha1s).to contain_exactly(upload1.sha1, upload2.sha1)
     end
 
     it "correctly identifies missing uploads with short url" do
@@ -1591,11 +1705,7 @@ describe Post do
     end
 
     it "should skip external urls with upload url in query string" do
-      SiteSetting.enable_s3_uploads = true
-      SiteSetting.s3_upload_bucket = "s3-upload-bucket"
-      SiteSetting.s3_access_key_id = "some key"
-      SiteSetting.s3_secret_access_key = "some secret key"
-      SiteSetting.s3_cdn_url = "https://cdn.s3.amazonaws.com"
+      setup_s3
 
       urls = []
       upload = Fabricate(:upload_s3)
@@ -1603,14 +1713,5 @@ describe Post do
       post.each_upload_url { |src, _, _| urls << src }
       expect(urls).to be_empty
     end
-  end
-
-  def enable_secure_media_and_s3
-    SiteSetting.authorized_extensions = "pdf|png|jpg|csv"
-    SiteSetting.enable_s3_uploads = true
-    SiteSetting.s3_upload_bucket = "s3-upload-bucket"
-    SiteSetting.s3_access_key_id = "some key"
-    SiteSetting.s3_secret_access_key = "some secret key"
-    SiteSetting.secure_media = true
   end
 end

@@ -36,7 +36,7 @@ module ApplicationHelper
   end
 
   def shared_session_key
-    if SiteSetting.long_polling_base_url != '/'.freeze && current_user
+    if SiteSetting.long_polling_base_url != '/' && current_user
       sk = "shared_session_key"
       return request.env[sk] if request.env[sk]
 
@@ -55,7 +55,7 @@ module ApplicationHelper
   end
 
   def script_asset_path(script)
-    path = asset_path("#{script}.js")
+    path = ActionController::Base.helpers.asset_path("#{script}.js")
 
     if GlobalSetting.use_s3? && GlobalSetting.s3_cdn_url
       if GlobalSetting.cdn_url
@@ -77,7 +77,7 @@ module ApplicationHelper
         path = path.gsub(/\.([^.]+)$/, '.gz.\1')
       end
 
-    elsif GlobalSetting.cdn_url&.start_with?("https") && is_brotli_req?
+    elsif GlobalSetting.cdn_url&.start_with?("https") && is_brotli_req? && Rails.env != "development"
       path = path.gsub("#{GlobalSetting.cdn_url}/assets/", "#{GlobalSetting.cdn_url}/brotli_asset/")
     end
 
@@ -207,7 +207,7 @@ module ApplicationHelper
   end
 
   def html_lang
-    SiteSetting.default_locale.sub("_", "-")
+    (request ? I18n.locale.to_s : SiteSetting.default_locale).sub("_", "-")
   end
 
   # Creates open graph and twitter card meta data
@@ -282,7 +282,7 @@ module ApplicationHelper
         'query-input' => 'required name=search_term_string',
       }
     }
-    content_tag(:script, MultiJson.dump(json).html_safe, type: 'application/ld+json'.freeze)
+    content_tag(:script, MultiJson.dump(json).html_safe, type: 'application/ld+json')
   end
 
   def gsub_emoji_to_unicode(str)
@@ -291,16 +291,24 @@ module ApplicationHelper
 
   def application_logo_url
     @application_logo_url ||= begin
-      if mobile_view? && SiteSetting.site_mobile_logo_url.present?
-        SiteSetting.site_mobile_logo_url
+      if mobile_view?
+        if dark_color_scheme? && SiteSetting.site_mobile_logo_dark_url.present?
+          SiteSetting.site_mobile_logo_dark_url
+        elsif SiteSetting.site_mobile_logo_url.present?
+          SiteSetting.site_mobile_logo_url
+        end
       else
-        SiteSetting.site_logo_url
+        if dark_color_scheme? && SiteSetting.site_logo_dark_url.present?
+          SiteSetting.site_logo_dark_url
+        else
+          SiteSetting.site_logo_url
+        end
       end
     end
   end
 
   def login_path
-    "#{Discourse::base_uri}/login"
+    "#{Discourse.base_path}/login"
   end
 
   def mobile_view?
@@ -356,6 +364,7 @@ module ApplicationHelper
   end
 
   def loading_admin?
+    return false unless defined?(controller)
     controller.class.name.split("::").first == "Admin"
   end
 
@@ -401,11 +410,23 @@ module ApplicationHelper
   end
 
   def scheme_id
+    return @scheme_id if defined?(@scheme_id)
+
+    custom_user_scheme_id = cookies[:color_scheme_id] || current_user&.user_option&.color_scheme_id
+    if custom_user_scheme_id && ColorScheme.find_by_id(custom_user_scheme_id)
+      return custom_user_scheme_id
+    end
+
     return if theme_ids.blank?
-    Theme
+
+    @scheme_id = Theme
       .where(id: theme_ids.first)
       .pluck(:color_scheme_id)
       .first
+  end
+
+  def dark_scheme_id
+    cookies[:dark_scheme_id] || current_user&.user_option&.dark_scheme_id || SiteSetting.default_dark_mode_color_scheme_id
   end
 
   def current_homepage
@@ -449,6 +470,21 @@ module ApplicationHelper
     Stylesheet::Manager.stylesheet_link_tag(name, 'all', ids)
   end
 
+  def discourse_color_scheme_stylesheets
+    result = +""
+    result << Stylesheet::Manager.color_scheme_stylesheet_link_tag(scheme_id, 'all', theme_ids)
+
+    if dark_scheme_id != -1
+      result << Stylesheet::Manager.color_scheme_stylesheet_link_tag(dark_scheme_id, '(prefers-color-scheme: dark)', theme_ids)
+    end
+    result.html_safe
+  end
+
+  def dark_color_scheme?
+    return false if scheme_id.blank?
+    ColorScheme.find_by_id(scheme_id)&.is_dark?
+  end
+
   def preloaded_json
     return '{}' if @preloaded.blank?
     @preloaded.transform_values { |value| escape_unicode(value) }.to_json
@@ -460,7 +496,7 @@ module ApplicationHelper
     setup_data = {
       cdn: Rails.configuration.action_controller.asset_host,
       base_url: Discourse.base_url,
-      base_uri: Discourse::base_uri,
+      base_uri: Discourse.base_path,
       environment: Rails.env,
       letter_avatar_version: LetterAvatar.version,
       markdown_it_url: script_asset_path('markdown-it-bundle'),
@@ -471,6 +507,9 @@ module ApplicationHelper
       highlight_js_path: HighlightJs.path,
       svg_sprite_path: SvgSprite.path(theme_ids),
       enable_js_error_reporting: GlobalSetting.enable_js_error_reporting,
+      color_scheme_is_dark: dark_color_scheme?,
+      user_color_scheme_id: scheme_id,
+      user_dark_scheme_id: dark_scheme_id
     }
 
     if Rails.env.development?
@@ -495,12 +534,10 @@ module ApplicationHelper
 
   def get_absolute_image_url(link)
     absolute_url = link
-    if link.start_with?("//")
+    if link.start_with?('//')
       uri = URI(Discourse.base_url)
       absolute_url = "#{uri.scheme}:#{link}"
-    elsif link.start_with?("/uploads/")
-      absolute_url = "#{Discourse.base_url}#{link}"
-    elsif link.start_with?("/images/")
+    elsif link.start_with?('/uploads/', '/images/', '/user_avatar/')
       absolute_url = "#{Discourse.base_url}#{link}"
     elsif GlobalSetting.relative_url_root && link.start_with?(GlobalSetting.relative_url_root)
       absolute_url = "#{Discourse.base_url_no_prefix}#{link}"
@@ -511,6 +548,28 @@ module ApplicationHelper
   def can_sign_up?
     SiteSetting.allow_new_registrations &&
     !SiteSetting.invite_only &&
-    !SiteSetting.enable_sso
+    !SiteSetting.enable_discourse_connect
+  end
+
+  def rss_creator(user)
+    if user
+      if SiteSetting.prioritize_username_in_ux
+        "#{user.username}"
+      else
+        "#{user.name.presence || user.username }"
+      end
+    end
+  end
+
+  def authentication_data
+    return @authentication_data if defined?(@authentication_data)
+
+    @authentication_data = begin
+      value = cookies[:authentication_data]
+      if value
+        cookies.delete(:authentication_data, path: Discourse.base_path("/"))
+      end
+      current_user ? nil : value
+    end
   end
 end

@@ -33,10 +33,14 @@ describe Topic do
 
       describe 'censored words' do
         after do
-          Discourse.redis.flushall
+          Discourse.redis.flushdb
         end
 
         describe 'when title contains censored words' do
+          after do
+            WordWatcher.clear_cache!
+          end
+
           it 'should not be valid' do
             ['pineapple', 'pen'].each { |w| Fabricate(:watched_word, word: w, action: WatchedWord.actions[:censor]) }
 
@@ -88,6 +92,10 @@ describe Topic do
 
       describe 'blocked words' do
         describe 'when title contains watched words' do
+          after do
+            WordWatcher.clear_cache!
+          end
+
           it 'should not be valid' do
             Fabricate(:watched_word, word: 'pineapple', action: WatchedWord.actions[:block])
 
@@ -255,17 +263,25 @@ describe Topic do
   end
 
   context 'topic title uniqueness' do
+    let!(:category1) { Fabricate(:category) }
+    let!(:category2) { Fabricate(:category) }
 
-    let!(:topic) { Fabricate(:topic) }
-    let(:new_topic) { Fabricate.build(:topic, title: topic.title) }
+    let!(:topic) { Fabricate(:topic, category: category1) }
+    let(:new_topic) { Fabricate.build(:topic, title: topic.title, category: category1) }
+    let(:new_topic_different_cat) { Fabricate.build(:topic, title: topic.title, category: category2) }
 
     context "when duplicates aren't allowed" do
       before do
-        SiteSetting.expects(:allow_duplicate_topic_titles?).returns(false)
+        SiteSetting.allow_duplicate_topic_titles = false
+        SiteSetting.allow_duplicate_topic_titles_category = false
       end
 
       it "won't allow another topic to be created with the same name" do
         expect(new_topic).not_to be_valid
+      end
+
+      it "won't even allow another topic to be created with the same name but different category" do
+        expect(new_topic_different_cat).not_to be_valid
       end
 
       it "won't allow another topic with an upper case title to be created" do
@@ -286,11 +302,27 @@ describe Topic do
 
     context "when duplicates are allowed" do
       before do
-        SiteSetting.expects(:allow_duplicate_topic_titles?).returns(true)
+        SiteSetting.allow_duplicate_topic_titles = true
+        SiteSetting.allow_duplicate_topic_titles_category = false
       end
 
       it "will allow another topic to be created with the same name" do
         expect(new_topic).to be_valid
+      end
+    end
+
+    context "when duplicates are allowed if the category is different" do
+      before do
+        SiteSetting.allow_duplicate_topic_titles = false
+        SiteSetting.allow_duplicate_topic_titles_category = true
+      end
+
+      it "will allow another topic to be created with the same name but different category" do
+        expect(new_topic_different_cat).to be_valid
+      end
+
+      it "won't allow another topic to be created with the same name in same category" do
+        expect(new_topic).not_to be_valid
       end
     end
 
@@ -478,37 +510,74 @@ describe Topic do
     end
   end
 
-  context 'similar_to' do
+  context '.similar_to' do
+    fab!(:category) { Fabricate(:category_with_definition) }
 
-    it 'returns blank with nil params' do
-      expect(Topic.similar_to(nil, nil)).to be_blank
+    it 'returns an empty array with nil params' do
+      expect(Topic.similar_to(nil, nil)).to eq([])
     end
 
     context "with a category definition" do
-      let!(:category) { Fabricate(:category_with_definition) }
-
       it "excludes the category definition topic from similar_to" do
-        expect(Topic.similar_to('category definition for', "no body")).to be_blank
+        expect(Topic.similar_to('category definition for', "no body")).to eq([])
       end
     end
 
+    it 'does not result in a syntax error when raw is blank after cooking' do
+      expect(Topic.similar_to('some title', '#')).to eq([])
+    end
+
+    it 'does not result in invalid statement when prepared data is blank' do
+      expect(Topic.similar_to('some title', 'https://discourse.org/#INCORRECT#URI')).to be_empty
+    end
+
     context 'with a similar topic' do
-      let!(:topic) {
+      fab!(:post) {
         SearchIndexer.enable
-        post = create_post(title: "Evil trout is the dude who posted this topic")
-        post.topic
+        create_post(title: "Evil trout is the dude who posted this topic")
       }
+
+      let(:topic) { post.topic }
+
+      before do
+        SearchIndexer.enable
+      end
 
       it 'returns the similar topic if the title is similar' do
         expect(Topic.similar_to("has evil trout made any topics?", "i am wondering has evil trout made any topics?")).to eq([topic])
       end
 
-      context "secure categories" do
-        fab!(:category) { Fabricate(:category_with_definition, read_restricted: true) }
+      it 'returns the similar topic even if raw is blank' do
+        expect(Topic.similar_to("has evil trout made any topics?", "")).to eq([topic])
+      end
 
+      it 'matches title against title and raw against raw when searching for topics' do
+        topic.update!(title: '1 2 3 numbered titles')
+        post.update!(raw: 'random toy poodle')
+
+        expect(Topic.similar_to("unrelated term", "1 2 3 poddle")).to eq([])
+      end
+
+      it 'doesnt match numbered lists against numbers in Post#raw' do
+        post.update!(raw: <<~RAW)
+        Internet Explorer 11+ Oct 2013 Google Chrome 32+ Jan 2014 Firefox 27+ Feb 2014 Safari 6.1+ Jul 2012 Safari, iOS 8+ Oct 2014
+        RAW
+
+        post.topic.update!(title: 'Where are we with browser support in 2019?')
+
+        topics = Topic.similar_to("Videos broken in composer", <<~RAW)
+        1. Do something
+        2. Do something else
+        3. Do more things
+        RAW
+
+        expect(topics).to eq([])
+      end
+
+      context "secure categories" do
         before do
-          topic.category = category
-          topic.save
+          category.update!(read_restricted: true)
+          topic.update!(category: category)
         end
 
         it "doesn't return topics from private categories" do
@@ -618,11 +687,22 @@ describe Topic do
           expect(Post.last.action_code).to eq("removed_user")
         end
 
+        it 'should not create a small action if user is already invited through a group' do
+          group = Fabricate(:group, users: [user, another_user])
+          expect(topic.invite_group(user, group)).to eq(true)
+
+          expect { topic.invite(user, another_user.username) }
+            .to change { Notification.count }.by(1)
+            .and change { Post.where(post_type: Post.types[:small_action]).count }.by(0)
+        end
+
         context "from a muted user" do
           before { MutedUser.create!(user: another_user, muted_user: user) }
 
-          it 'silently fails' do
-            expect(topic.invite(user, another_user.username)).to eq(true)
+          it 'fails with an error message' do
+            expect { topic.invite(user, another_user.username) }
+              .to raise_error(Topic::NotAllowed)
+              .with_message(I18n.t("topic_invite.muted_invitee"))
             expect(topic.allowed_users).to_not include(another_user)
             expect(Post.last).to be_blank
             expect(Notification.last).to be_blank
@@ -637,6 +717,52 @@ describe Topic do
           it 'should raise error' do
             expect { topic.invite(user, another_user.username) }
               .to raise_error(Topic::UserExists)
+          end
+        end
+
+        context "when invited_user has enabled allow_list" do
+          fab!(:user2) { Fabricate(:user) }
+          fab!(:admin) { Fabricate(:admin) }
+          fab!(:pm) { Fabricate(:private_message_topic, user: user, topic_allowed_users: [
+            Fabricate.build(:topic_allowed_user, user: user),
+            Fabricate.build(:topic_allowed_user, user: user2)
+          ]) }
+
+          it 'succeeds when inviter is in allowed list' do
+            AllowedPmUser.create!(user: another_user, allowed_pm_user: user)
+            expect(topic.invite(user, another_user.username)).to eq(true)
+          end
+
+          it 'should raise error when inviter not in allowed list' do
+            another_user.user_option.update!(enable_allowed_pm_users: true)
+            AllowedPmUser.create!(user: another_user, allowed_pm_user: user2)
+            expect { topic.invite(user, another_user.username) }
+              .to raise_error(Topic::NotAllowed)
+              .with_message(I18n.t("topic_invite.receiver_does_not_allow_pm"))
+          end
+
+          it 'should succeed for staff even when not allowed' do
+            another_user.user_option.update!(enable_allowed_pm_users: true)
+            AllowedPmUser.create!(user: another_user, allowed_pm_user: user2)
+            expect(topic.invite(another_user, admin.username)).to eq(true)
+          end
+
+          it 'should raise error when target_user is not in inviters allowed list' do
+            user.user_option.update!(enable_allowed_pm_users: true)
+            another_user.user_option.update!(enable_allowed_pm_users: true)
+            AllowedPmUser.create!(user: another_user, allowed_pm_user: user)
+            expect { topic.invite(user, another_user.username) }
+              .to raise_error(Topic::NotAllowed)
+              .with_message(I18n.t("topic_invite.sender_does_not_allow_pm"))
+          end
+
+          it 'should raise error if target_user has not allowed any of the other participants' do
+            another_user.user_option.update!(enable_allowed_pm_users: true)
+            AllowedPmUser.create!(user: another_user, allowed_pm_user: user)
+
+            expect { pm.invite(user, another_user.username) }
+              .to raise_error(Topic::NotAllowed)
+              .with_message(I18n.t("topic_invite.receiver_does_not_allow_other_user_pm"))
           end
         end
       end
@@ -758,8 +884,9 @@ describe Topic do
         context "for a muted topic" do
           before { TopicUser.change(another_user.id, topic.id, notification_level: TopicUser.notification_levels[:muted]) }
 
-          it 'silently fails' do
-            expect(topic.invite(user, another_user.username)).to eq(true)
+          it 'fails with an error message' do
+            expect { topic.invite(user, another_user.username) }
+              .to raise_error(Topic::NotAllowed)
             expect(topic.allowed_users).to_not include(another_user)
             expect(Post.last).to be_blank
             expect(Notification.last).to be_blank
@@ -783,9 +910,9 @@ describe Topic do
   end
 
   context 'private message' do
-    let(:coding_horror) { User.find_by(username: "CodingHorror") }
+    let(:coding_horror) { Fabricate(:coding_horror) }
     fab!(:evil_trout) { Fabricate(:evil_trout) }
-    let(:topic) { Fabricate(:private_message_topic) }
+    let(:topic) { Fabricate(:private_message_topic, recipient: coding_horror) }
 
     it "should integrate correctly" do
       expect(Guardian.new(topic.user).can_see?(topic)).to eq(true)
@@ -979,7 +1106,7 @@ describe Topic do
     fab!(:topic) { Fabricate(:topic, bumped_at: 1.hour.ago) }
 
     before do
-      @original_bumped_at = topic.bumped_at.to_f
+      @original_bumped_at = topic.bumped_at
       @user = topic.user
       @user.admin = true
     end
@@ -991,7 +1118,7 @@ describe Topic do
           topic.reload
           expect(topic).not_to be_visible
           expect(topic.moderator_posts_count).to eq(1)
-          expect(topic.bumped_at.to_f).to be_within(1e-4).of(@original_bumped_at)
+          expect(topic.bumped_at).to eq_time(@original_bumped_at)
         end
 
         it 'removes itself as featured topic on user profiles' do
@@ -1013,7 +1140,7 @@ describe Topic do
         it 'should be visible with correct counts' do
           expect(topic).to be_visible
           expect(topic.moderator_posts_count).to eq(1)
-          expect(topic.bumped_at.to_f).to be_within(1e-4).of(@original_bumped_at)
+          expect(topic.bumped_at).to eq_time(@original_bumped_at)
         end
       end
     end
@@ -1028,7 +1155,7 @@ describe Topic do
         it "doesn't have a pinned_at but has correct dates" do
           expect(topic.pinned_at).to be_blank
           expect(topic.moderator_posts_count).to eq(1)
-          expect(topic.bumped_at.to_f).to be_within(1e-4).of(@original_bumped_at)
+          expect(topic.bumped_at).to eq_time(@original_bumped_at)
         end
       end
 
@@ -1041,7 +1168,7 @@ describe Topic do
 
         it 'should enable correctly' do
           expect(topic.pinned_at).to be_present
-          expect(topic.bumped_at.to_f).to be_within(1e-4).of(@original_bumped_at)
+          expect(topic.bumped_at).to eq_time(@original_bumped_at)
           expect(topic.moderator_posts_count).to eq(1)
         end
 
@@ -1049,17 +1176,21 @@ describe Topic do
     end
 
     context 'archived' do
+      it 'should create a staff action log entry' do
+        expect { topic.update_status('archived', true, @user) }.to change { UserHistory.where(action: UserHistory.actions[:topic_archived]).count }.by(1)
+      end
+
       context 'disable' do
         before do
           @archived_topic = Fabricate(:topic, archived: true, bumped_at: 1.hour.ago)
-          @original_bumped_at = @archived_topic.bumped_at.to_f
+          @original_bumped_at = @archived_topic.bumped_at
           @archived_topic.update_status('archived', false, @user)
           @archived_topic.reload
         end
 
         it 'should archive correctly' do
           expect(@archived_topic).not_to be_archived
-          expect(@archived_topic.bumped_at.to_f).to be_within(1e-4).of(@original_bumped_at)
+          expect(@archived_topic.bumped_at).to eq_time(@original_bumped_at)
           expect(@archived_topic.moderator_posts_count).to eq(1)
         end
       end
@@ -1074,7 +1205,7 @@ describe Topic do
         it 'should be archived' do
           expect(topic).to be_archived
           expect(topic.moderator_posts_count).to eq(1)
-          expect(topic.bumped_at.to_f).to be_within(1e-4).of(@original_bumped_at)
+          expect(topic.bumped_at).to eq_time(@original_bumped_at)
         end
       end
     end
@@ -1083,7 +1214,7 @@ describe Topic do
       context 'disable' do
         before do
           @closed_topic = Fabricate(:topic, closed: true, bumped_at: 1.hour.ago)
-          @original_bumped_at = @closed_topic.bumped_at.to_f
+          @original_bumped_at = @closed_topic.bumped_at
           @closed_topic.update_status(status, false, @user)
           @closed_topic.reload
         end
@@ -1091,7 +1222,7 @@ describe Topic do
         it 'should not be pinned' do
           expect(@closed_topic).not_to be_closed
           expect(@closed_topic.moderator_posts_count).to eq(1)
-          expect(@closed_topic.bumped_at.to_f).not_to be_within(1e-4).of(@original_bumped_at)
+          expect(@closed_topic.bumped_at).not_to eq_time(@original_bumped_at)
         end
       end
 
@@ -1104,7 +1235,7 @@ describe Topic do
 
         it 'should be closed' do
           expect(topic).to be_closed
-          expect(topic.bumped_at.to_f).to be_within(1e-4).of(@original_bumped_at)
+          expect(topic.bumped_at).to eq_time(@original_bumped_at)
           expect(topic.moderator_posts_count).to eq(1)
           expect(topic.topic_timers.first).to eq(nil)
         end
@@ -1113,12 +1244,24 @@ describe Topic do
 
     context 'closed' do
       let(:status) { 'closed' }
-      it_should_behave_like 'a status that closes a topic'
+      it_behaves_like 'a status that closes a topic'
+
+      it 'should archive group message' do
+        group = Fabricate(:group)
+        group.add(@user)
+        topic = Fabricate(:private_message_topic, allowed_groups: [group])
+
+        expect { topic.update_status(status, true, @user) }.to change(topic.group_archived_messages, :count).by(1)
+      end
+
+      it 'should create a staff action log entry' do
+        expect { topic.update_status(status, true, @user) }.to change { UserHistory.where(action: UserHistory.actions[:topic_closed]).count }.by(1)
+      end
     end
 
     context 'autoclosed' do
       let(:status) { 'autoclosed' }
-      it_should_behave_like 'a status that closes a topic'
+      it_behaves_like 'a status that closes a topic'
 
       context 'topic was set to close when it was created' do
         it 'includes the autoclose duration in the moderator post' do
@@ -1453,9 +1596,12 @@ describe Topic do
         describe 'when new category is set to auto close by default' do
           before do
             new_category.update!(auto_close_hours: 5)
+            topic.user.update!(admin: true)
           end
 
           it 'should set a topic timer' do
+            freeze_time
+
             expect { topic.change_category_to_id(new_category.id) }
               .to change { TopicTimer.count }.by(1)
 
@@ -1463,8 +1609,9 @@ describe Topic do
 
             topic_timer = TopicTimer.last
 
+            expect(topic_timer.user).to eq(Discourse.system_user)
             expect(topic_timer.topic).to eq(topic)
-            expect(topic_timer.execute_at).to be_within(1.second).of(Time.zone.now + 5.hours)
+            expect(topic_timer.execute_at).to eq_time(5.hours.from_now)
           end
 
           describe 'when topic is already closed' do
@@ -1489,11 +1636,8 @@ describe Topic do
               topic.change_category_to_id(new_category.id)
 
               expect(topic.reload.category).to eq(new_category)
-
               expect(topic.public_topic_timer).to eq(topic_timer)
-
-              expect(topic.public_topic_timer.execute_at)
-                .to be_within(1.second).of(topic_timer.execute_at)
+              expect(topic.public_topic_timer.execute_at).to eq_time(topic_timer.execute_at)
             end
           end
         end
@@ -1583,20 +1727,6 @@ describe Topic do
     end
   end
 
-  describe '#private_topic_timer' do
-    let(:topic_timer) do
-      Fabricate(:topic_timer,
-        public_type: false,
-        user: user,
-        status_type: TopicTimer.private_types[:reminder]
-      )
-    end
-
-    it 'should return the right record' do
-      expect(topic_timer.topic.private_topic_timer(user)).to eq(topic_timer)
-    end
-  end
-
   describe '#set_or_create_timer' do
     let(:topic) { Fabricate.build(:topic) }
 
@@ -1611,33 +1741,36 @@ describe Topic do
       freeze_time now
 
       topic.set_or_create_timer(TopicTimer.types[:close], 72, by_user: admin)
-      expect(topic.topic_timers.first.execute_at).to eq(3.days.from_now)
+      expect(topic.topic_timers.first.execute_at).to eq_time(3.days.from_now)
     end
 
     it 'can take a number of hours as a string' do
       freeze_time now
       topic.set_or_create_timer(TopicTimer.types[:close], '18', by_user: admin)
-      expect(topic.topic_timers.first.execute_at).to eq(18.hours.from_now)
+      expect(topic.topic_timers.first.execute_at).to eq_time(18.hours.from_now)
     end
 
     it 'can take a number of hours as a string and can handle based on last post' do
       freeze_time now
-      topic.set_or_create_timer(TopicTimer.types[:close], '18', by_user: admin, based_on_last_post: true)
-      expect(topic.topic_timers.first.execute_at).to eq(18.hours.from_now)
+      topic.set_or_create_timer(TopicTimer.types[:close], nil, by_user: admin, based_on_last_post: true, duration_minutes: '1080')
+      expect(topic.topic_timers.first.execute_at).to eq_time(18.hours.from_now)
     end
 
     it "can take a timestamp for a future time" do
       freeze_time now
       topic.set_or_create_timer(TopicTimer.types[:close], '2013-11-22 5:00', by_user: admin)
-      expect(topic.topic_timers.first.execute_at).to eq(Time.zone.local(2013, 11, 22, 5, 0))
+      expect(topic.topic_timers.first.execute_at).to eq_time(Time.zone.local(2013, 11, 22, 5, 0))
     end
 
     it "sets a validation error when given a timestamp in the past" do
       freeze_time now
-      topic.set_or_create_timer(TopicTimer.types[:close], '2013-11-19 5:00', by_user: admin)
 
-      expect(topic.topic_timers.first.execute_at).to eq(Time.zone.local(2013, 11, 19, 5, 0))
-      expect(topic.topic_timers.first.errors[:execute_at]).to be_present
+      expect do
+        topic.set_or_create_timer(
+          TopicTimer.types[:close],
+          '2013-11-19 5:00', by_user: admin
+        )
+      end.to raise_error(Discourse::InvalidParameters)
     end
 
     it "sets a validation error when give a timestamp of an invalid format" do
@@ -1655,7 +1788,7 @@ describe Topic do
     it "can take a timestamp with timezone" do
       freeze_time now
       topic.set_or_create_timer(TopicTimer.types[:close], '2013-11-25T01:35:00-08:00', by_user: admin)
-      expect(topic.topic_timers.first.execute_at).to eq(Time.utc(2013, 11, 25, 9, 35))
+      expect(topic.topic_timers.first.execute_at).to eq_time(Time.utc(2013, 11, 25, 9, 35))
     end
 
     it 'sets topic status update user to given user if it is a staff or TL4 user' do
@@ -1699,7 +1832,7 @@ describe Topic do
     it 'updates topic status update execute_at if it was already set to close' do
       freeze_time now
       closing_topic.set_or_create_timer(TopicTimer.types[:close], 48)
-      expect(closing_topic.reload.public_topic_timer.execute_at).to eq(2.days.from_now)
+      expect(closing_topic.reload.public_topic_timer.execute_at).to eq_time(2.days.from_now)
     end
 
     it 'should not delete topic_timer of another status_type' do
@@ -1718,7 +1851,7 @@ describe Topic do
         TopicTimer.types[:publish_to_category], 72, by_user: admin
       )
 
-      expect(topic_timer.execute_at).to eq(3.days.from_now)
+      expect(topic_timer.execute_at).to eq_time(3.days.from_now)
     end
 
     it "does not update topic's topic status created_at it was already set to close" do
@@ -1732,9 +1865,10 @@ describe Topic do
       let(:topic) { Fabricate(:topic, category: category) }
 
       it "should be able to override category's default auto close" do
+        freeze_time
         Jobs.run_immediately!
 
-        expect(topic.topic_timers.first.duration).to eq(4)
+        expect(topic.topic_timers.first.execute_at).to eq_time(topic.created_at + 4.hours)
 
         topic.set_or_create_timer(TopicTimer.types[:close], 2, by_user: admin)
 
@@ -1742,40 +1876,8 @@ describe Topic do
 
         freeze_time 3.hours.from_now
 
-        TopicTimer.ensure_consistency!
+        Jobs::TopicTimerEnqueuer.new.execute
         expect(topic.reload.closed).to eq(true)
-      end
-    end
-
-    describe "private status type" do
-      fab!(:topic) { Fabricate(:topic) }
-      let(:reminder) { Fabricate(:topic_timer, user: admin, topic: topic, status_type: TopicTimer.types[:reminder]) }
-      fab!(:other_admin) { Fabricate(:admin) }
-
-      it "lets two users have their own record" do
-        reminder
-        expect {
-          topic.set_or_create_timer(TopicTimer.types[:reminder], 2, by_user: other_admin)
-        }.to change { TopicTimer.count }.by(1)
-      end
-
-      it 'should not be override when setting a public topic timer' do
-        reminder
-
-        expect do
-          topic.set_or_create_timer(TopicTimer.types[:close], 3, by_user: reminder.user)
-        end.to change { TopicTimer.count }.by(1)
-      end
-
-      it "can update a user's existing record" do
-        freeze_time now
-
-        reminder
-        expect {
-          topic.set_or_create_timer(TopicTimer.types[:reminder], 11, by_user: admin)
-        }.to_not change { TopicTimer.count }
-        reminder.reload
-        expect(reminder.execute_at).to eq(11.hours.from_now)
       end
     end
   end
@@ -1793,19 +1895,19 @@ describe Topic do
       end
 
       it "doesn't return category topics" do
-        Fabricate(:category_with_definition)
+        Fabricate(:category_with_definition, created_at: 1.minute.ago)
         expect(Topic.for_digest(user, 1.year.ago, top_order: true)).to be_blank
       end
 
       it "returns regular topics" do
-        topic = Fabricate(:topic)
+        topic = Fabricate(:topic, created_at: 1.minute.ago)
         expect(Topic.for_digest(user, 1.year.ago, top_order: true)).to eq([topic])
       end
 
       it "doesn't return topics from muted categories" do
         user = Fabricate(:user)
-        category = Fabricate(:category_with_definition)
-        Fabricate(:topic, category: category)
+        category = Fabricate(:category_with_definition, created_at: 2.minutes.ago)
+        Fabricate(:topic, category: category, created_at: 1.minute.ago)
 
         CategoryUser.set_notification_level_for_category(user, CategoryUser.notification_levels[:muted], category.id)
 
@@ -1813,7 +1915,7 @@ describe Topic do
       end
 
       it "doesn't return topics that a user has muted" do
-        topic = Fabricate(:topic)
+        topic = Fabricate(:topic, created_at: 1.minute.ago)
         user = Fabricate(:user)
 
         Fabricate(:topic_user,
@@ -1827,8 +1929,8 @@ describe Topic do
 
       it "doesn't return topics from suppressed categories" do
         user = Fabricate(:user)
-        category = Fabricate(:category_with_definition)
-        Fabricate(:topic, category: category)
+        category = Fabricate(:category_with_definition, created_at: 2.minutes.ago)
+        Fabricate(:topic, category: category, created_at: 1.minute.ago)
 
         SiteSetting.digest_suppress_categories = "#{category.id}"
 
@@ -1837,20 +1939,20 @@ describe Topic do
 
       it "doesn't return topics from TL0 users" do
         new_user = Fabricate(:user, trust_level: 0)
-        Fabricate(:topic, user: new_user)
+        Fabricate(:topic, user: new_user, created_at: 1.minute.ago)
         expect(Topic.for_digest(user, 1.year.ago, top_order: true)).to be_blank
       end
 
       it "returns topics from TL0 users if given include_tl0" do
         new_user = Fabricate(:user, trust_level: 0)
-        topic = Fabricate(:topic, user_id: new_user.id)
+        topic = Fabricate(:topic, user_id: new_user.id, created_at: 1.minute.ago)
 
         expect(Topic.for_digest(user, 1.year.ago, top_order: true, include_tl0: true)).to eq([topic])
       end
 
       it "returns topics from TL0 users if enabled in preferences" do
         new_user = Fabricate(:user, trust_level: 0)
-        topic = Fabricate(:topic, user: new_user)
+        topic = Fabricate(:topic, user: new_user, created_at: 1.minute.ago)
 
         u = Fabricate(:user)
         u.user_option.include_tl0_in_digests = true
@@ -1862,7 +1964,7 @@ describe Topic do
         user = Fabricate(:user)
         tag = Fabricate(:tag)
         TagUser.change(user.id, tag.id, TagUser.notification_levels[:muted])
-        Fabricate(:topic, tags: [tag])
+        Fabricate(:topic, tags: [tag], created_at: 1.minute.ago)
 
         expect(Topic.for_digest(user, 1.year.ago, top_order: true)).to be_blank
       end
@@ -1871,7 +1973,7 @@ describe Topic do
         user = Fabricate(:user)
         muted_tag, other_tag = Fabricate(:tag), Fabricate(:tag)
         TagUser.change(user.id, muted_tag.id, TagUser.notification_levels[:muted])
-        topic = Fabricate(:topic, tags: [muted_tag, other_tag])
+        topic = Fabricate(:topic, tags: [muted_tag, other_tag], created_at: 1.minute.ago)
 
         expect(Topic.for_digest(user, 1.year.ago, top_order: true)).to eq([topic])
       end
@@ -1880,32 +1982,34 @@ describe Topic do
         user = Fabricate(:user)
         muted_tag = Fabricate(:tag)
         TagUser.change(user.id, muted_tag.id, TagUser.notification_levels[:muted])
-        _topic1 = Fabricate(:topic, tags: [muted_tag])
-        topic2 = Fabricate(:topic, tags: [Fabricate(:tag), Fabricate(:tag)])
-        topic3 = Fabricate(:topic)
-
+        _topic1 = Fabricate(:topic, tags: [muted_tag], created_at: 1.minute.ago)
+        topic2 = Fabricate(:topic, tags: [Fabricate(:tag), Fabricate(:tag)], created_at: 1.minute.ago)
+        topic3 = Fabricate(:topic, created_at: 1.minute.ago)
         topics = Topic.for_digest(user, 1.year.ago, top_order: true)
+
         expect(topics.size).to eq(2)
         expect(topics).to contain_exactly(topic2, topic3)
       end
 
       it "sorts by category notification levels" do
-        category1, category2 = Fabricate(:category_with_definition), Fabricate(:category_with_definition)
-        2.times { |i| Fabricate(:topic, category: category1) }
-        topic1 = Fabricate(:topic, category: category2)
-        2.times { |i| Fabricate(:topic, category: category1) }
+        category1, category2 = Fabricate(:category_with_definition), Fabricate(:category_with_definition, created_at: 2.minutes.ago)
+        2.times { |i| Fabricate(:topic, category: category1, created_at: 1.minute.ago) }
+        topic1 = Fabricate(:topic, category: category2, created_at: 1.minute.ago)
+        2.times { |i| Fabricate(:topic, category: category1, created_at: 1.minute.ago) }
         CategoryUser.create(user: user, category: category2, notification_level: CategoryUser.notification_levels[:watching])
         for_digest = Topic.for_digest(user, 1.year.ago, top_order: true)
+
         expect(for_digest.first).to eq(topic1)
       end
 
       it "sorts by topic notification levels" do
         topics = []
-        3.times { |i| topics << Fabricate(:topic) }
+        3.times { |i| topics << Fabricate(:topic, created_at: 1.minute.ago) }
         user = Fabricate(:user)
         TopicUser.create(user_id: user.id, topic_id: topics[0].id, notification_level: TopicUser.notification_levels[:tracking])
         TopicUser.create(user_id: user.id, topic_id: topics[2].id, notification_level: TopicUser.notification_levels[:watching])
         for_digest = Topic.for_digest(user, 1.year.ago, top_order: true).pluck(:id)
+
         expect(for_digest).to eq([topics[2].id, topics[0].id, topics[1].id])
       end
     end
@@ -2073,7 +2177,7 @@ describe Topic do
       topic_embed = TopicEmbed.create!(topic_id: topic.id, embed_url: "https://blog.codinghorror.com/password-rules-are-bullshit", post_id: post.id, deleted_at: 1.day.ago)
       topic.recover!
       topic_embed.reload
-      expect(topic_embed.deleted_at).to eq(nil)
+      expect(topic_embed.deleted_at).to be_nil
     end
   end
 
@@ -2123,6 +2227,29 @@ describe Topic do
 
       freeze_time(start + 28.hours)
       expect { create_post(user: user, topic_id: topic_id) }.to raise_error(RateLimiter::LimitExceeded)
+    end
+  end
+
+  context "per day personal message limit" do
+    before do
+      SiteSetting.max_personal_messages_per_day = 1
+      SiteSetting.max_topics_per_day = 0
+      SiteSetting.max_topics_in_first_day = 0
+      RateLimiter.enable
+    end
+
+    after do
+      RateLimiter.clear_all!
+      RateLimiter.disable
+    end
+
+    it "limits according to max_personal_messages_per_day" do
+      user1 = Fabricate(:user)
+      user2 = Fabricate(:user)
+      create_post(user: user, archetype: 'private_message', target_usernames: [user1.username, user2.username])
+      expect {
+        create_post(user: user, archetype: 'private_message', target_usernames: [user1.username, user2.username])
+      }.to raise_error(RateLimiter::LimitExceeded)
     end
   end
 
@@ -2228,18 +2355,21 @@ describe Topic do
     user.admin = true
     @topic_status_event_triggered = false
 
-    DiscourseEvent.on(:topic_status_updated) do
+    blk = Proc.new do
       @topic_status_event_triggered = true
     end
+
+    DiscourseEvent.on(:topic_status_updated, &blk)
 
     topic.update_status('closed', true, user)
     topic.reload
 
     expect(@topic_status_event_triggered).to eq(true)
+  ensure
+    DiscourseEvent.off(:topic_status_updated, &blk)
   end
 
   it 'allows users to normalize counts' do
-
     topic = Fabricate(:topic, last_posted_at: 1.year.ago)
     post1 = Fabricate(:post, topic: topic, post_number: 1)
     post2 = Fabricate(:post, topic: topic, post_type: Post.types[:whisper], post_number: 2)
@@ -2250,7 +2380,7 @@ describe Topic do
     expect(topic.posts_count).to eq(1)
     expect(topic.highest_post_number).to eq(post1.post_number)
     expect(topic.highest_staff_post_number).to eq(post2.post_number)
-    expect(topic.last_posted_at).to be_within(1.second).of (post1.created_at)
+    expect(topic.last_posted_at).to eq_time(post1.created_at)
   end
 
   context 'featured link' do
@@ -2328,6 +2458,20 @@ describe Topic do
       expect(r.count).to eq(1)
       expect(r[0]["hours"].to_f.round).to eq(1)
       expect(Topic.time_to_first_response_total).to eq(1)
+    end
+
+    it "should have results if there's a topic with replies" do
+      SiteSetting.max_category_nesting = 3
+
+      category = Fabricate(:category_with_definition)
+      subcategory = Fabricate(:category_with_definition, parent_category_id: category.id)
+      subsubcategory = Fabricate(:category_with_definition, parent_category_id: subcategory.id)
+
+      topic = Fabricate(:topic, category: subsubcategory, created_at: 3.hours.ago)
+      Fabricate(:post, topic: topic, user: topic.user, post_number: 1, created_at: 3.hours.ago)
+      Fabricate(:post, topic: topic, post_number: 2, created_at: 2.hours.ago)
+
+      expect(Topic.time_to_first_response_total(category_id: category.id, include_subcategories: true)).to eq(1)
     end
 
     it "should only count regular posts as the first response" do
@@ -2540,6 +2684,117 @@ describe Topic do
 
       topic.update(category: category)
       expect(user.user_profile.reload.featured_topic).to eq(nil)
+    end
+  end
+
+  describe '#auto_close_threshold_reached?' do
+    before do
+      Reviewable.set_priorities(low: 2.0, medium: 6.0, high: 9.0)
+      SiteSetting.num_flaggers_to_close_topic = 2
+      SiteSetting.reviewable_default_visibility = 'medium'
+      SiteSetting.auto_close_topic_sensitivity = Reviewable.sensitivity[:high]
+      post = Fabricate(:post)
+      @topic = post.topic
+      @reviewable = Fabricate(:reviewable_flagged_post, target: post, topic: @topic)
+    end
+
+    it 'ignores flags with a low score' do
+      5.times do
+        @reviewable.add_score(
+          Fabricate(:user, trust_level: TrustLevel[0]),
+          PostActionType.types[:spam],
+          created_at: 1.minute.ago
+        )
+      end
+
+      expect(@topic.auto_close_threshold_reached?).to eq(false)
+    end
+
+    it 'returns true when the flags have a high score' do
+      5.times do
+        @reviewable.add_score(
+          Fabricate(:user, admin: true),
+          PostActionType.types[:spam],
+          created_at: 1.minute.ago
+        )
+      end
+
+      expect(@topic.auto_close_threshold_reached?).to eq(true)
+    end
+  end
+
+  describe '#update_action_counts' do
+    let(:topic) { Fabricate(:topic) }
+
+    it 'updates like count without including whisper posts' do
+      post = Fabricate(:post, topic: topic)
+      whisper_post = Fabricate(:post, topic: topic, post_type: Post.types[:whisper])
+
+      topic.update_action_counts
+      expect(topic.like_count).to eq(0)
+
+      PostAction.create!(post: post, user: user, post_action_type_id: PostActionType.types[:like])
+
+      topic.update_action_counts
+      expect(topic.like_count).to eq(1)
+
+      PostAction.create!(post: whisper_post, user: user, post_action_type_id: PostActionType.types[:like])
+
+      topic.update_action_counts
+      expect(topic.like_count).to eq(1)
+    end
+  end
+
+  describe "#incoming_email_addresses" do
+    fab!(:group) do
+      Fabricate(
+        :group,
+        smtp_server: "imap.gmail.com",
+        smtp_port: 587,
+        email_username: "discourse@example.com",
+        email_password: "discourse@example.com"
+      )
+    end
+
+    fab!(:topic) do
+      Fabricate(:private_message_topic,
+        topic_allowed_groups: [
+          Fabricate.build(:topic_allowed_group, group: group)
+        ]
+      )
+    end
+
+    let!(:incoming1) do
+      Fabricate(:incoming_email, to_addresses: "discourse@example.com", from_address: "johnsmith@user.com", topic: topic, post: topic.posts.first, created_at: 20.minutes.ago)
+    end
+    let!(:incoming2) do
+      Fabricate(:incoming_email, from_address: "discourse@example.com", to_addresses: "johnsmith@user.com", topic: topic, post: Fabricate(:post, topic: topic), created_at: 10.minutes.ago)
+    end
+    let!(:incoming3) do
+      Fabricate(:incoming_email, to_addresses: "discourse@example.com", from_address: "johnsmith@user.com", topic: topic, post: topic.posts.first, cc_addresses: "otherguy@user.com", created_at: 2.minutes.ago)
+    end
+    let!(:incoming4) do
+      Fabricate(:incoming_email, to_addresses: "unrelated@test.com", from_address: "discourse@example.com", topic: topic, post: topic.posts.first, created_at: 1.minutes.ago)
+    end
+
+    it "returns an array of all the incoming email addresses" do
+      expect(topic.incoming_email_addresses).to match_array(
+        ["discourse@example.com", "johnsmith@user.com", "otherguy@user.com", "unrelated@test.com"]
+      )
+    end
+
+    it "returns an array of all the incoming email addresses where incoming was received before X" do
+      expect(topic.incoming_email_addresses(received_before: 5.minutes.ago)).to match_array(
+        ["discourse@example.com", "johnsmith@user.com"]
+      )
+    end
+
+    context "when the group is present" do
+      it "excludes incoming emails that are not to or CCd to the group" do
+        expect(topic.incoming_email_addresses(group: group)).not_to include(
+          "unrelated@test.com"
+        )
+      end
     end
   end
 end

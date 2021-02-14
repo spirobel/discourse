@@ -729,7 +729,7 @@ describe PostAction do
         topic_status_update = TopicTimer.last
 
         expect(topic_status_update.topic).to eq(topic)
-        expect(topic_status_update.execute_at).to be_within(1.second).of(1.hour.from_now)
+        expect(topic_status_update.execute_at).to eq_time(1.hour.from_now)
         expect(topic_status_update.status_type).to eq(TopicTimer.types[:open])
       end
 
@@ -763,16 +763,11 @@ describe PostAction do
         expect(timer.execute_at).to eq_time(1.hour.from_now)
 
         freeze_time timer.execute_at
-        Jobs.expects(:enqueue_in).with(
-          1.hour.to_i,
-          :toggle_topic_closed,
-          topic_timer_id: timer.id,
-          state: false
-        ).returns(true)
-        Jobs::ToggleTopicClosed.new.execute(topic_timer_id: timer.id, state: false)
+
+        Jobs::OpenTopic.new.execute(topic_timer_id: timer.id)
 
         expect(topic.reload.closed).to eq(true)
-        expect(timer.reload.execute_at).to eq(1.hour.from_now)
+        expect(timer.reload.execute_at).to eq_time(1.hour.from_now)
 
         freeze_time timer.execute_at
         SiteSetting.num_flaggers_to_close_topic = 10

@@ -80,7 +80,6 @@ module SvgSprite
     "fab-facebook-square",
     "fab-facebook",
     "fab-github",
-    "fab-google-plus-square",
     "fab-instagram",
     "fab-linux",
     "fab-twitter",
@@ -95,6 +94,7 @@ module SvgSprite
     "far-clipboard",
     "far-clock",
     "far-comment",
+    "far-comments",
     "far-copyright",
     "far-dot-circle",
     "far-edit",
@@ -106,6 +106,7 @@ module SvgSprite
     "far-heart",
     "far-image",
     "far-list-alt",
+    "far-meh",
     "far-moon",
     "far-smile",
     "far-square",
@@ -129,7 +130,9 @@ module SvgSprite
     "hands-helping",
     "heading",
     "heart",
+    "history",
     "home",
+    "hourglass-start",
     "id-card",
     "info-circle",
     "italic",
@@ -145,6 +148,7 @@ module SvgSprite
     "minus",
     "minus-circle",
     "mobile-alt",
+    "moon",
     "paint-brush",
     "paper-plane",
     "pencil-alt",
@@ -170,9 +174,12 @@ module SvgSprite
     "sign-in-alt",
     "sign-out-alt",
     "signal",
+    "star",
     "step-backward",
     "step-forward",
+    "stopwatch",
     "stream",
+    "sync-alt",
     "sync",
     "table",
     "tag",
@@ -183,6 +190,8 @@ module SvgSprite
     "thumbtack",
     "times",
     "times-circle",
+    "toggle-off",
+    "toggle-on",
     "trash-alt",
     "tv",
     "undo",
@@ -197,7 +206,8 @@ module SvgSprite
     "user-shield",
     "user-times",
     "users",
-    "wrench"
+    "wrench",
+    "spinner"
   ])
 
   FA_ICON_MAP = { 'far fa-' => 'far-', 'fab fa-' => 'fab-', 'fas fa-' => '', 'fa-' => '' }
@@ -207,24 +217,26 @@ module SvgSprite
   THEME_SPRITE_VAR_NAME = "icons-sprite"
 
   def self.custom_svg_sprites(theme_ids = [])
-    custom_sprite_paths = Dir.glob("#{Rails.root}/plugins/*/svg-icons/*.svg")
+    get_set_cache("custom_svg_sprites_#{Theme.transform_ids(theme_ids).join(',')}") do
+      custom_sprite_paths = Dir.glob("#{Rails.root}/plugins/*/svg-icons/*.svg")
 
-    ThemeField.where(type_id: ThemeField.types[:theme_upload_var], name: THEME_SPRITE_VAR_NAME, theme_id: Theme.transform_ids(theme_ids))
-      .pluck(:upload_id).each do |upload_id|
+      ThemeField.where(type_id: ThemeField.types[:theme_upload_var], name: THEME_SPRITE_VAR_NAME, theme_id: Theme.transform_ids(theme_ids))
+        .pluck(:upload_id).each do |upload_id|
 
-      upload = Upload.find(upload_id) rescue nil
+        upload = Upload.find(upload_id) rescue nil
 
-      if Discourse.store.external?
-        external_copy = Discourse.store.download(upload) rescue nil
-        original_path = external_copy.try(:path)
-      else
-        original_path = Discourse.store.path_for(upload)
+        if Discourse.store.external?
+          external_copy = Discourse.store.download(upload) rescue nil
+          original_path = external_copy.try(:path)
+        else
+          original_path = Discourse.store.path_for(upload)
+        end
+
+        custom_sprite_paths << original_path if original_path.present?
       end
 
-      custom_sprite_paths << original_path if original_path.present?
+      custom_sprite_paths
     end
-
-    custom_sprite_paths
   end
 
   def self.all_icons(theme_ids = [])
@@ -384,7 +396,7 @@ License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL
   end
 
   def self.group_icons
-    Group.where("flair_url LIKE '%fa-%'").pluck(:flair_url).uniq
+    Group.pluck(:flair_icon).uniq
   end
 
   def self.theme_icons(theme_ids)
@@ -398,6 +410,8 @@ License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL
         end
       end
     end
+
+    theme_icon_settings |= ThemeModifierHelper.new(theme_ids: theme_ids).svg_icons
 
     theme_icon_settings
   end
@@ -415,18 +429,10 @@ License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL
     icons
   end
 
-  def self.fa4_shim_file
-    "#{Rails.root}/lib/svg_sprite/fa4-renames.json"
-  end
-
-  def self.fa4_to_fa5_names
-    @db ||= File.open(fa4_shim_file, "r:UTF-8") { |f| JSON.parse(f.read) }
-  end
-
   def self.process(icon_name)
     icon_name = icon_name.strip
     FA_ICON_MAP.each { |k, v| icon_name = icon_name.sub(k, v) }
-    fa4_to_fa5_names[icon_name] || icon_name
+    icon_name
   end
 
   def self.get_set_cache(key)

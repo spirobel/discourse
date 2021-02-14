@@ -57,6 +57,24 @@ describe PostValidator do
       validator.stripped_length(post)
       expect(post.errors.count).to eq(0)
     end
+
+    it "ignores an html comment" do
+      post.raw = "<!-- an html comment -->abc"
+      validator.stripped_length(post)
+      expect(post.errors.count).to eq(1)
+    end
+
+    it "ignores multiple html comments" do
+      post.raw = "<!-- an html comment -->\n abc \n<!-- a comment -->"
+      validator.stripped_length(post)
+      expect(post.errors.count).to eq(1)
+    end
+
+    it "ignores nested html comments" do
+      post.raw = "<!-- <!-- an html comment --> -->"
+      validator.stripped_length(post)
+      expect(post.errors.count).to eq(1)
+    end
   end
 
   context "too_many_posts" do
@@ -137,45 +155,45 @@ describe PostValidator do
     end
   end
 
-  context "too_many_images" do
+  context "too_many_embedded_media" do
     before do
-      SiteSetting.min_trust_to_post_images = 0
-      SiteSetting.newuser_max_images = 2
+      SiteSetting.min_trust_to_post_embedded_media = 0
+      SiteSetting.newuser_max_embedded_media = 2
     end
 
     it "should be invalid when new user exceeds max mentions limit" do
       post.acting_user = build(:newuser)
-      post.expects(:image_count).returns(3)
-      validator.max_images_validator(post)
+      post.expects(:embedded_media_count).returns(3)
+      validator.max_embedded_media_validator(post)
       expect(post.errors.count).to be > 0
     end
 
     it "should be valid when new user does not exceed max mentions limit" do
       post.acting_user = build(:newuser)
-      post.expects(:image_count).returns(2)
-      validator.max_images_validator(post)
+      post.expects(:embedded_media_count).returns(2)
+      validator.max_embedded_media_validator(post)
       expect(post.errors.count).to be(0)
     end
 
     it "should be invalid when user trust level is not sufficient" do
-      SiteSetting.min_trust_to_post_images = 4
+      SiteSetting.min_trust_to_post_embedded_media = 4
       post.acting_user = build(:leader)
-      post.expects(:image_count).returns(2)
-      validator.max_images_validator(post)
+      post.expects(:embedded_media_count).returns(2)
+      validator.max_embedded_media_validator(post)
       expect(post.errors.count).to be > 0
     end
 
     it "should be valid for moderator in all cases" do
       post.acting_user = build(:moderator)
-      post.expects(:image_count).never
-      validator.max_images_validator(post)
+      post.expects(:embedded_media_count).never
+      validator.max_embedded_media_validator(post)
       expect(post.errors.count).to be(0)
     end
 
     it "should be valid for admin in all cases" do
       post.acting_user = build(:admin)
-      post.expects(:image_count).never
-      validator.max_images_validator(post)
+      post.expects(:embedded_media_count).never
+      validator.max_embedded_media_validator(post)
       expect(post.errors.count).to be(0)
     end
   end
@@ -290,7 +308,7 @@ describe PostValidator do
       validator.expects(:raw_quality).never
       validator.expects(:max_posts_validator).never
       validator.expects(:max_mention_validator).never
-      validator.expects(:max_images_validator).never
+      validator.expects(:max_embedded_media_validator).never
       validator.expects(:max_attachments_validator).never
       validator.expects(:newuser_links_validator).never
       validator.expects(:unique_post_validator).never

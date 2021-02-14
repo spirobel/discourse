@@ -103,11 +103,10 @@ describe PostActionCreator do
       before do
         user.trust_level = TrustLevel[3]
         post.user.trust_level = TrustLevel[0]
+        SiteSetting.high_trust_flaggers_auto_hide_posts = true
       end
 
       it "hides the post when the flagger is a TL3 user and the poster is a TL0 user" do
-        SiteSetting.high_trust_flaggers_auto_hide_posts = true
-
         result = PostActionCreator.create(user, post, :spam)
 
         expect(post.hidden?).to eq(true)
@@ -119,6 +118,14 @@ describe PostActionCreator do
         result = PostActionCreator.create(user, post, :spam)
 
         expect(post.hidden?).to eq(false)
+      end
+
+      it 'sets the force_review field' do
+        result = PostActionCreator.create(user, post, :spam)
+
+        reviewable = result.reviewable
+
+        expect(reviewable.force_review).to eq(true)
       end
     end
 
@@ -145,9 +152,30 @@ describe PostActionCreator do
         before { reviewable.perform(admin, :ignore) }
 
         it "fails because the post was recently reviewed" do
+          freeze_time 10.seconds.from_now
           result = PostActionCreator.create(user, post, :inappropriate)
 
           expect(result.success?).to eq(false)
+        end
+
+        it "succeeds with other flag action types" do
+          freeze_time 10.seconds.from_now
+          spam_result = PostActionCreator.create(user, post, :spam)
+
+          expect(reviewable.reload.pending?).to eq(true)
+        end
+
+        it "fails when other flag action types are open" do
+          freeze_time 10.seconds.from_now
+          spam_result = PostActionCreator.create(user, post, :spam)
+
+          inappropriate_result = PostActionCreator.create(Fabricate(:user), post, :inappropriate)
+
+          reviewable.reload
+
+          expect(inappropriate_result.success?).to eq(false)
+          expect(reviewable.pending?).to eq(true)
+          expect(reviewable.reviewable_scores.select(&:pending?).count).to eq(1)
         end
 
         it "succesfully flags the post if it was reviewed more than 24 hours ago" do

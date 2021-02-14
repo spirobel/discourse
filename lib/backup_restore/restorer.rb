@@ -9,7 +9,7 @@ module BackupRestore
 
     attr_reader :success
 
-    def initialize(user_id:, filename:, factory:, disable_emails: true)
+    def initialize(user_id:, filename:, factory:, disable_emails: true, location:)
       @user_id = user_id
       @filename = filename
       @factory = factory
@@ -24,7 +24,7 @@ module BackupRestore
       @current_db = RailsMultisite::ConnectionManagement.current_db
 
       @system = factory.create_system_interface
-      @backup_file_handler = factory.create_backup_file_handler(@filename, @current_db)
+      @backup_file_handler = factory.create_backup_file_handler(@filename, @current_db, location)
       @database_restorer = factory.create_database_restorer(@current_db)
       @uploads_restorer = factory.create_uploads_restorer
     end
@@ -43,19 +43,26 @@ module BackupRestore
       validate_backup_metadata
 
       @system.enable_readonly_mode
-      @system.pause_sidekiq
+      @system.pause_sidekiq("restore")
       @system.wait_for_sidekiq
+      @system.flush_redis
+      @system.clear_sidekiq_queues
 
       @database_restorer.restore(db_dump_path)
 
       reload_site_settings
 
+      @system.unpause_sidekiq
       @system.disable_readonly_mode
+
+      clear_category_cache
+      clear_stats
+      reload_translations
+
+      @uploads_restorer.restore(@tmp_directory)
 
       clear_emoji_cache
       clear_theme_cache
-
-      @uploads_restorer.restore(@tmp_directory)
 
       after_restore_hook
     rescue Compression::Strategy::ExtractFailed
@@ -119,9 +126,22 @@ module BackupRestore
       end
     end
 
+    def clear_category_cache
+      log "Clearing category cache..."
+      Category.reset_topic_ids_cache
+      Category.clear_subcategory_ids
+    end
+
     def clear_emoji_cache
       log "Clearing emoji cache..."
       Emoji.clear_cache
+    rescue => ex
+      log "Something went wrong while clearing emoji cache.", ex
+    end
+
+    def reload_translations
+      log "Reloading translations..."
+      TranslationOverride.reload_all_overrides!
     end
 
     def notify_user
@@ -155,6 +175,12 @@ module BackupRestore
       ThemeField.force_recompilation!
       Theme.expire_site_cache!
       Stylesheet::Manager.cache.clear
+    rescue => ex
+      log "Something went wrong while clearing theme cache.", ex
+    end
+
+    def clear_stats
+      Discourse.stats.remove("missing_s3_uploads")
     end
 
     def after_restore_hook

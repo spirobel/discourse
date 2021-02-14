@@ -1,3 +1,4 @@
+import { ajax } from "discourse/lib/ajax";
 import { withPluginApi } from "discourse/lib/plugin-api";
 
 function initialize(api) {
@@ -9,10 +10,33 @@ function initialize(api) {
     didInsertElement() {
       this._super(...arguments);
       this.dispatch("header:search-context-trigger", "header");
-    }
+    },
   });
 
-  api.attachWidgetAction("header", "headerSearchContextTrigger", function() {
+  api.modifyClass("controller:topic", {
+    _togglePostBookmark(post) {
+      // if we are talking to discobot then any bookmarks should just
+      // be created without reminder options, to streamline the new user
+      // narrative.
+      const discobotUserId = -2;
+      if (post.user_id === discobotUserId && !post.bookmarked) {
+        return ajax("/bookmarks", {
+          type: "POST",
+          data: { post_id: post.id },
+        }).then((response) => {
+          post.setProperties({
+            "topic.bookmarked": true,
+            bookmarked: true,
+            bookmark_id: response.id,
+          });
+          post.appEvents.trigger("post-stream:refresh", { id: this.id });
+        });
+      }
+      return this._super(post);
+    },
+  });
+
+  api.attachWidgetAction("header", "headerSearchContextTrigger", function () {
     if (this.site.mobileView) {
       this.state.skipSearchContext = false;
     } else {
@@ -33,7 +57,8 @@ export default {
 
   initialize(container) {
     const siteSettings = container.lookup("site-settings:main");
-    if (siteSettings.discourse_narrative_bot_enabled)
+    if (siteSettings.discourse_narrative_bot_enabled) {
       withPluginApi("0.8.7", initialize);
-  }
+    }
+  },
 };

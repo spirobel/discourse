@@ -9,9 +9,10 @@ class TopicTrackingState
 
   include ActiveModel::SerializerSupport
 
-  CHANNEL = "/user-tracking"
-  UNREAD_MESSAGE_TYPE = "unread".freeze
-  LATEST_MESSAGE_TYPE = "latest".freeze
+  UNREAD_MESSAGE_TYPE = "unread"
+  LATEST_MESSAGE_TYPE = "latest"
+  MUTED_MESSAGE_TYPE = "muted"
+  UNMUTED_MESSAGE_TYPE = "unmuted"
 
   attr_accessor :user_id,
                 :topic_id,
@@ -24,18 +25,35 @@ class TopicTrackingState
   def self.publish_new(topic)
     return unless topic.regular?
 
+    tags, tag_ids = nil
+    if SiteSetting.tagging_enabled
+      topic.tags.pluck(:id, :name).each do |id, name|
+        tags ||= []
+        tag_ids ||= []
+
+        tags << name
+        tag_ids << id
+      end
+    end
+
+    payload = {
+      last_read_post_number: nil,
+      highest_post_number: 1,
+      created_at: topic.created_at,
+      topic_id: topic.id,
+      category_id: topic.category_id,
+      archetype: topic.archetype,
+    }
+
+    if tags
+      payload[:tags] = tags
+      payload[:topic_tag_ids] = tag_ids
+    end
+
     message = {
       topic_id: topic.id,
       message_type: "new_topic",
-      payload: {
-        last_read_post_number: nil,
-        highest_post_number: 1,
-        created_at: topic.created_at,
-        topic_id: topic.id,
-        category_id: topic.category_id,
-        archetype: topic.archetype,
-        topic_tag_ids: topic.tags.pluck(:id)
-      }
+      payload: payload
     }
 
     group_ids = topic.category && topic.category.secure_group_ids
@@ -71,6 +89,37 @@ class TopicTrackingState
     "/unread/#{user_id}"
   end
 
+  def self.publish_muted(topic)
+    user_ids = topic.topic_users
+      .where(notification_level: NotificationLevels.all[:muted])
+      .joins(:user)
+      .where("users.last_seen_at > ?", 7.days.ago)
+      .order("users.last_seen_at DESC")
+      .limit(100)
+      .pluck(:user_id)
+    return if user_ids.blank?
+    message = {
+      topic_id: topic.id,
+      message_type: MUTED_MESSAGE_TYPE,
+    }
+    MessageBus.publish("/latest", message.as_json, user_ids: user_ids)
+  end
+
+  def self.publish_unmuted(topic)
+    return if !SiteSetting.mute_all_categories_by_default
+    user_ids = User.watching_topic_when_mute_categories_by_default(topic)
+      .where("users.last_seen_at > ?", 7.days.ago)
+      .order("users.last_seen_at DESC")
+      .limit(100)
+      .pluck(:id)
+    return if user_ids.blank?
+    message = {
+      topic_id: topic.id,
+      message_type: UNMUTED_MESSAGE_TYPE,
+    }
+    MessageBus.publish("/latest", message.as_json, user_ids: user_ids)
+  end
+
   def self.publish_unread(post)
     return unless post.topic.regular?
     # TODO at high scale we are going to have to defer this,
@@ -83,22 +132,31 @@ class TopicTrackingState
         post.topic.category && post.topic.category.secure_group_ids
       end
 
+    tags = nil
+    if include_tags_in_report?
+      tags = post.topic.tags.pluck(:name)
+    end
+
     TopicUser
       .tracking(post.topic_id)
       .select([:user_id, :last_read_post_number, :notification_level])
       .each do |tu|
 
+      payload = {
+        last_read_post_number: tu.last_read_post_number,
+        highest_post_number: post.post_number,
+        created_at: post.created_at,
+        category_id: post.topic.category_id,
+        notification_level: tu.notification_level,
+        archetype: post.topic.archetype
+      }
+
+      payload[:tags] = tags if tags
+
       message = {
         topic_id: post.topic_id,
         message_type: UNREAD_MESSAGE_TYPE,
-        payload: {
-          last_read_post_number: tu.last_read_post_number,
-          highest_post_number: post.post_number,
-          created_at: post.created_at,
-          category_id: post.topic.category_id,
-          notification_level: tu.notification_level,
-          archetype: post.topic.archetype
-        }
+        payload: payload
       }
 
       MessageBus.publish(self.unread_channel_key(tu.user_id), message.as_json, group_ids: group_ids)
@@ -129,6 +187,17 @@ class TopicTrackingState
     MessageBus.publish("/delete", message.as_json, group_ids: group_ids)
   end
 
+  def self.publish_destroy(topic)
+    group_ids = topic.category && topic.category.secure_group_ids
+
+    message = {
+      topic_id: topic.id,
+      message_type: "destroy"
+    }
+
+    MessageBus.publish("/destroy", message.as_json, group_ids: group_ids)
+  end
+
   def self.publish_read(topic_id, last_read_post_number, user_id, notification_level = nil)
     highest_post_number = DB.query_single("SELECT highest_post_number FROM topics WHERE id = ?", topic_id).first
 
@@ -146,8 +215,10 @@ class TopicTrackingState
     MessageBus.publish(self.unread_channel_key(user_id), message.as_json, user_ids: [user_id])
   end
 
-  def self.publish_dismiss_new(user_id, category_id = nil)
-    payload = category_id ? { category_id: category_id } : {}
+  def self.publish_dismiss_new(user_id, category_id: nil, tag_id: nil)
+    payload = {}
+    payload[:category_id] = category_id if category_id
+    payload[:tag_id] = tag_id if tag_id
     message = {
       message_type: "dismiss_new",
       payload: payload
@@ -166,7 +237,15 @@ class TopicTrackingState
                 always: User::NewTopicDuration::ALWAYS,
                 default_duration: SiteSetting.default_other_new_topic_duration_minutes,
                 min_date: Time.at(SiteSetting.min_new_topics_time).to_datetime
-              ).where_clause.send(:predicates)[0]
+              ).where_clause.ast.to_sql
+  end
+
+  def self.include_tags_in_report?
+    SiteSetting.tagging_enabled && (@include_tags_in_report || SiteSetting.show_filter_by_tag)
+  end
+
+  def self.include_tags_in_report=(v)
+    @include_tags_in_report = v
   end
 
   def self.report(user, topic_id = nil)
@@ -178,6 +257,8 @@ class TopicTrackingState
     #
     # This code needs to be VERY efficient as it is triggered via the message bus and may steal
     #  cycles from usual requests
+    tag_ids = muted_tag_ids(user)
+
     sql = +report_raw_sql(
       topic_id: topic_id,
       skip_unread: true,
@@ -185,7 +266,7 @@ class TopicTrackingState
       staff: user.staff?,
       admin: user.admin?,
       user: user,
-      muted_tag_ids: muted_tag_ids(user)
+      muted_tag_ids: tag_ids
     )
 
     sql << "\nUNION ALL\n\n"
@@ -198,8 +279,20 @@ class TopicTrackingState
       filter_old_unread: true,
       admin: user.admin?,
       user: user,
-      muted_tag_ids: muted_tag_ids(user)
+      muted_tag_ids: tag_ids
     )
+
+    if SiteSetting.tagging_enabled && TopicTrackingState.include_tags_in_report?
+      sql = <<~SQL
+        WITH X AS (#{sql})
+        SELECT *, (
+          SELECT ARRAY_AGG(name) from topic_tags
+             JOIN tags on tags.id = topic_tags.tag_id
+             WHERE topic_id = X.topic_id
+          ) tags
+        FROM X
+      SQL
+    end
 
     DB.query(
       sql,
@@ -222,8 +315,7 @@ class TopicTrackingState
       else
         TopicQuery
           .unread_filter(Topic, -999, staff: opts && opts[:staff])
-          .where_clause.send(:predicates)
-          .join(" AND ")
+          .where_clause.ast.to_sql
           .gsub("-999", ":user_id")
       end
 
@@ -238,9 +330,9 @@ class TopicTrackingState
       if opts[:skip_new]
         "1=0"
       else
-        TopicQuery.new_filter(Topic, "xxx").where_clause.send(:predicates).join(" AND ").gsub!("'xxx'", treat_as_new_topic_clause) +
+        TopicQuery.new_filter(Topic, "xxx").where_clause.ast.to_sql.gsub!("'xxx'", treat_as_new_topic_clause) +
           " AND topics.created_at > :min_new_topic_date" +
-          " AND (category_users.last_seen_at IS NULL OR topics.created_at > category_users.last_seen_at)"
+          " AND dismissed_topic_users.id IS NULL"
       end
 
     select = (opts[:select]) || "
@@ -276,18 +368,26 @@ class TopicTrackingState
         "(topics.visible #{append}) AND"
       end
 
-    tags_filter =
-      if opts[:muted_tag_ids].present? && SiteSetting.remove_muted_tags_from_latest == 'always'
-        <<~SQL
-          NOT ((select array_agg(tag_id) from topic_tags where topic_tags.topic_id = topics.id) && ARRAY[#{opts[:muted_tag_ids].join(',')}]) AND
+    tags_filter = ""
+
+    if (muted_tag_ids = opts[:muted_tag_ids]).present? && ['always', 'only_muted'].include?(SiteSetting.remove_muted_tags_from_latest)
+      existing_tags_sql = "(select array_agg(tag_id) from topic_tags where topic_tags.topic_id = topics.id)"
+      muted_tags_array_sql = "ARRAY[#{opts[:muted_tag_ids].join(',')}]"
+
+      if SiteSetting.remove_muted_tags_from_latest == 'always'
+        tags_filter = <<~SQL
+          NOT (
+            COALESCE(#{existing_tags_sql}, ARRAY[]::int[]) && #{muted_tags_array_sql}
+          ) AND
         SQL
-      elsif opts[:muted_tag_ids].present? && SiteSetting.remove_muted_tags_from_latest == 'only_muted'
-        <<~SQL
-          NOT ((select array_agg(tag_id) from topic_tags where topic_tags.topic_id = topics.id) <@ ARRAY[#{opts[:muted_tag_ids].join(',')}]) AND
+      else # only muted
+        tags_filter = <<~SQL
+          NOT (
+            COALESCE(#{existing_tags_sql}, ARRAY[-999]) <@ #{muted_tags_array_sql}
+          ) AND
         SQL
-      else
-        ""
       end
+    end
 
     sql = +<<~SQL
     SELECT #{select}
@@ -298,6 +398,7 @@ class TopicTrackingState
     JOIN categories c ON c.id = topics.category_id
     LEFT JOIN topic_users tu ON tu.topic_id = topics.id AND tu.user_id = u.id
     LEFT JOIN category_users ON category_users.category_id = topics.category_id AND category_users.user_id = #{opts[:user].id}
+    LEFT JOIN dismissed_topic_users ON dismissed_topic_users.topic_id = topics.id AND dismissed_topic_users.user_id = #{opts[:user].id}
     WHERE u.id = :user_id AND
           #{filter_old_unread}
           topics.archetype <> 'private_message' AND
@@ -366,11 +467,13 @@ SQL
     }
 
     channels.each do |channel, ids|
-      MessageBus.publish(
-        channel,
-        message.as_json,
-        user_ids: ids
-      )
+      if ids.present?
+        MessageBus.publish(
+          channel,
+          message.as_json,
+          user_ids: ids
+        )
+      end
     end
   end
 

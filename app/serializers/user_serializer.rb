@@ -16,7 +16,9 @@ class UserSerializer < UserCardSerializer
              :second_factor_backup_enabled,
              :second_factor_remaining_backup_codes,
              :associated_accounts,
-             :profile_background_upload_url
+             :profile_background_upload_url,
+             :can_upload_profile_header,
+             :can_upload_user_card_background
 
   has_one :invited_by, embed: :object, serializer: BasicUserSerializer
   has_many :groups, embed: :object, serializer: BasicGroupSerializer
@@ -33,6 +35,7 @@ class UserSerializer < UserCardSerializer
 
   private_attributes :locale,
                      :muted_category_ids,
+                     :regular_category_ids,
                      :watched_tags,
                      :watching_first_post_tags,
                      :tracked_tags,
@@ -49,10 +52,14 @@ class UserSerializer < UserCardSerializer
                      :has_title_badges,
                      :muted_usernames,
                      :ignored_usernames,
+                     :allowed_pm_usernames,
                      :mailing_list_posts_per_day,
                      :can_change_bio,
+                     :can_change_location,
+                     :can_change_website,
                      :user_api_keys,
-                     :user_auth_tokens
+                     :user_auth_tokens,
+                     :user_notification_schedule
 
   untrusted_attributes :bio_raw,
                        :bio_cooked,
@@ -61,6 +68,10 @@ class UserSerializer < UserCardSerializer
   ###
   ### ATTRIBUTES
   ###
+  #
+  def user_notification_schedule
+    object.user_notification_schedule || UserNotificationSchedule::DEFAULT
+  end
 
   def mailing_list_posts_per_day
     val = Post.estimate_posts_per_day
@@ -76,12 +87,16 @@ class UserSerializer < UserCardSerializer
     object.group_users.order(:group_id)
   end
 
+  def include_group_users?
+    (object.id && object.id == scope.user.try(:id)) || scope.is_admin?
+  end
+
   def include_associated_accounts?
     (object.id && object.id == scope.user.try(:id))
   end
 
   def include_second_factor_enabled?
-    (object&.id == scope.user&.id) || scope.is_staff?
+    (object&.id == scope.user&.id) || scope.is_admin?
   end
 
   def second_factor_enabled
@@ -105,7 +120,15 @@ class UserSerializer < UserCardSerializer
   end
 
   def can_change_bio
-    !(SiteSetting.enable_sso && SiteSetting.sso_overrides_bio)
+    !(SiteSetting.enable_discourse_connect && SiteSetting.discourse_connect_overrides_bio)
+  end
+
+  def can_change_location
+    !(SiteSetting.enable_discourse_connect && SiteSetting.discourse_connect_overrides_location)
+  end
+
+  def can_change_website
+    !(SiteSetting.enable_discourse_connect && SiteSetting.discourse_connect_overrides_website)
   end
 
   def user_api_keys
@@ -113,7 +136,7 @@ class UserSerializer < UserCardSerializer
       {
         id: k.id,
         application_name: k.application_name,
-        scopes: k.scopes.map { |s| I18n.t("user_api_key.scopes.#{s}") },
+        scopes: k.scopes.map { |s| I18n.t("user_api_key.scopes.#{s.name}") },
         created_at: k.created_at,
         last_used_at: k.last_used_at,
       }
@@ -155,6 +178,14 @@ class UserSerializer < UserCardSerializer
     scope.can_edit_name?(object)
   end
 
+  def can_upload_profile_header
+    scope.can_upload_profile_header?(object)
+  end
+
+  def can_upload_user_card_background
+    scope.can_upload_user_card_background?(object)
+  end
+
   ###
   ### STAFF ATTRIBUTES
   ###
@@ -194,6 +225,10 @@ class UserSerializer < UserCardSerializer
     CategoryUser.lookup(object, :muted).pluck(:category_id)
   end
 
+  def regular_category_ids
+    CategoryUser.lookup(object, :regular).pluck(:category_id)
+  end
+
   def tracked_category_ids
     CategoryUser.lookup(object, :tracking).pluck(:category_id)
   end
@@ -212,6 +247,10 @@ class UserSerializer < UserCardSerializer
 
   def ignored_usernames
     IgnoredUser.where(user_id: object.id).joins(:ignored_user).pluck(:username)
+  end
+
+  def allowed_pm_usernames
+    AllowedPmUser.where(user_id: object.id).joins(:allowed_pm_user).pluck(:username)
   end
 
   def system_avatar_upload_id
@@ -268,6 +307,18 @@ class UserSerializer < UserCardSerializer
 
   def profile_background_upload_url
     object.profile_background_upload&.url
+  end
+
+  private
+
+  def custom_field_keys
+    fields = super
+
+    if scope.can_edit?(object)
+      fields += DiscoursePluginRegistry.serialized_current_user_fields.to_a
+    end
+
+    fields
   end
 
 end

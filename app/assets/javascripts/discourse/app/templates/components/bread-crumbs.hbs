@@ -1,0 +1,26 @@
+{{#each categoryBreadcrumbs as |breadcrumb|}}
+  {{#if breadcrumb.hasOptions}}
+    {{category-drop
+      category=breadcrumb.category
+      categories=breadcrumb.options
+      tagId=tag.id
+      options=(hash
+        parentCategory=breadcrumb.parentCategory
+        subCategory=breadcrumb.isSubcategory
+        noSubcategories=breadcrumb.noSubcategories
+        autoFilterable=true
+      )
+    }}
+  {{/if}}
+{{/each}}
+
+{{#if siteSettings.tagging_enabled}}
+  {{#unless additionalTags}}
+    {{!-- the tag filter doesn't work with tag intersections, so hide it --}}
+    {{#if siteSettings.show_filter_by_tag}}
+      {{tag-drop firstCategory=category tagId=tag.id}}
+    {{/if}}
+  {{/unless}}
+{{/if}}
+
+{{plugin-outlet name="bread-crumbs-right" connectorTagName="li" tagName=""}}

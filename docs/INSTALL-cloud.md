@@ -1,12 +1,12 @@
 **Set up Discourse in the cloud in under 30 minutes** with zero knowledge of Rails or Linux shell. One example is [DigitalOcean][do], but these steps will work on any **Docker-compatible** cloud provider or local server.
 
->  🔔 Don't have 30 minutes to set this up? For a flat one-time fee of $99, the community can install Discourse in the cloud for you. [Click here to purchase a self-supported community install](https://www.literatecomputing.com/product/discourse-install/).
+>  🔔 Don't have 30 minutes to set this up? For a flat one-time fee of $150, the community can install Discourse in the cloud for you. [Click here to purchase a self-supported community install](https://www.literatecomputing.com/product/discourse-install/).
 
 ### Create New Cloud Server
 
 Create your new cloud server, for example [on DigitalOcean][do]:
 
-- The default of **Ubuntu 18.04 LTS x64** works fine. At minimum, a 64-bit Linux OS with a kernel version of 3.10+ is required.
+- The default of **the current supported LTS release of Ubuntu Server** works fine. At minimum, a 64-bit Linux OS with a modern kernel version is required.
 
 - The default of **1 GB** RAM works fine for small Discourse communities. We recommend 2 GB RAM for larger communities.
 
@@ -14,7 +14,7 @@ Create your new cloud server, for example [on DigitalOcean][do]:
 
 - Enter your domain `discourse.example.com` as the Droplet name.
 
-Create your new Droplet. You will receive an email with the root password. (However, if you know [how to use SSH keys](https://www.google.com/search?q=digitalocean+ssh+keys), you may not need a password to log in.)
+Create your new Droplet. You may receive an email with the root password, however, [you should set up SSH keys](https://www.google.com/search?q=digitalocean+ssh+keys), as they are more secure.
 
 ### Access Your Cloud Server
 
@@ -22,9 +22,7 @@ Connect to your server via its IP address using SSH, or [Putty][put] on Windows:
 
     ssh root@192.168.1.1
 
-Enter the root password from the email DigitalOcean sent you when the server was set up. You will be prompted to change the root password.
-
-<img src="https://www.discourse.org/images/install/15/ssh-login-terminal.png" width="600px">
+Either use the root password from the email DigitalOcean sent you when the server was set up, or have a valid SSH key configured on your local machine.
 
 ### Install Docker / Git (Optional)
 

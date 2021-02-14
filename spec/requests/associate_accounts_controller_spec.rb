@@ -52,7 +52,7 @@ RSpec.describe Users::AssociateAccountsController do
       # Request associate info
       uri = URI.parse(response.redirect_url)
       get "#{uri.path}.json"
-      data = JSON.parse(response.body)
+      data = response.parsed_body
       expect(data["provider_name"]).to eq("google_oauth2")
       expect(data["account_description"]).to eq("someemail@test.com")
 
@@ -64,11 +64,12 @@ RSpec.describe Users::AssociateAccountsController do
       # Back to first user
       sign_in(user)
       get "#{uri.path}.json"
-      data = JSON.parse(response.body)
+      data = response.parsed_body
       expect(data["provider_name"]).to eq("google_oauth2")
 
       # Make the connection
       events = DiscourseEvent.track_events { post "#{uri.path}.json" }
+      expect(events.any? { |e| e[:event_name] == :before_auth }).to eq(true)
       expect(events.any? { |e| e[:event_name] === :after_auth && Auth::GoogleOAuth2Authenticator === e[:params][0] && !e[:params][1].failed? }).to eq(true)
 
       expect(response.status).to eq(200)

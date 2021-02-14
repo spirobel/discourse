@@ -7,6 +7,10 @@ describe Theme do
     Theme.clear_cache!
   end
 
+  before do
+    I18n.locale = :en
+  end
+
   fab! :user do
     Fabricate(:user)
   end
@@ -288,7 +292,7 @@ HTML
       expect(javascript_cache.content).to include("_registerPluginCode('0.1'")
     end
 
-    it "converts errors to a script type that is not evaluated" do
+    it "wraps constants calls in a readOnlyError function" do
       html = <<HTML
         <script type='text/discourse-plugin' version='0.1'>
           const x = 1;
@@ -298,8 +302,8 @@ HTML
 
       baked, javascript_cache = transpile(html)
       expect(baked).to include(javascript_cache.url)
-      expect(javascript_cache.content).to include('Theme Transpilation Error')
-      expect(javascript_cache.content).to include('read-only')
+      expect(javascript_cache.content).to include('var x = 1;')
+      expect(javascript_cache.content).to include('x = (_readOnlyError("x"), 2);')
     end
   end
 
@@ -324,7 +328,7 @@ HTML
       theme.reload
       expect(theme.theme_fields.find_by(name: :scss).error).to eq(nil)
 
-      scss, _map = Stylesheet::Compiler.compile('@import "common/foundation/variables"; @import "theme_variables"; @import "desktop_theme"; ', "theme.scss", theme_id: theme.id)
+      scss, _map = Stylesheet::Manager.new(:desktop_theme, theme.id).compile(force: true)
       expect(scss).to include(upload.url)
     end
   end
@@ -335,7 +339,7 @@ HTML
       theme.set_field(target: :common, name: :scss, value: 'body {background-color: $background_color; font-size: $font-size}')
       theme.save!
 
-      scss, _map = Stylesheet::Compiler.compile('@import "theme_variables"; @import "desktop_theme"; ', "theme.scss", theme_id: theme.id)
+      scss, _map = Stylesheet::Manager.new(:desktop_theme, theme.id).compile(force: true)
       expect(scss).to include("background-color:red")
       expect(scss).to include("font-size:25px")
 
@@ -343,7 +347,7 @@ HTML
       setting.value = '30px'
       theme.save!
 
-      scss, _map = Stylesheet::Compiler.compile('@import "theme_variables"; @import "desktop_theme"; ', "theme.scss", theme_id: theme.id)
+      scss, _map = Stylesheet::Manager.new(:desktop_theme, theme.id).compile(force: true)
       expect(scss).to include("font-size:30px")
 
       # Escapes correctly. If not, compiling this would throw an exception
@@ -355,7 +359,7 @@ HTML
       theme.set_field(target: :common, name: :scss, value: 'body {font-size: quote($font-size)}')
       theme.save!
 
-      scss, _map = Stylesheet::Compiler.compile('@import "theme_variables"; @import "desktop_theme"; ', "theme.scss", theme_id: theme.id)
+      scss, _map = Stylesheet::Manager.new(:desktop_theme, theme.id).compile(force: true)
       expect(scss).to include('font-size:"#{$fakeinterpolatedvariable}\a andanothervalue \'withquotes\'; margin: 0;\a"')
     end
 
@@ -376,16 +380,21 @@ HTML
       (function () {
         if ('Discourse' in window && typeof Discourse._registerPluginCode === 'function') {
           var __theme_name__ = "awesome theme\\\"";
+
           var settings = Discourse.__container__.lookup("service:theme-settings").getObjectForTheme(#{theme.id});
+
           var themePrefix = function themePrefix(key) {
-            return 'theme_translations.#{theme.id}.' + key;
+            return "theme_translations.#{theme.id}.".concat(key);
           };
 
           Discourse._registerPluginCode('1.0', function (api) {
             try {
-              alert(settings.name);var a = function a() {};
+              alert(settings.name);
+
+              var a = function a() {};
             } catch (err) {
               var rescue = require("discourse/lib/utilities").rescueThemeError;
+
               rescue(__theme_name__, err, api);
             }
           });
@@ -412,16 +421,21 @@ HTML
       (function () {
         if ('Discourse' in window && typeof Discourse._registerPluginCode === 'function') {
           var __theme_name__ = "awesome theme\\\"";
+
           var settings = Discourse.__container__.lookup("service:theme-settings").getObjectForTheme(#{theme.id});
+
           var themePrefix = function themePrefix(key) {
-            return 'theme_translations.#{theme.id}.' + key;
+            return "theme_translations.#{theme.id}.".concat(key);
           };
 
           Discourse._registerPluginCode('1.0', function (api) {
             try {
-              alert(settings.name);var a = function a() {};
+              alert(settings.name);
+
+              var a = function a() {};
             } catch (err) {
               var rescue = require("discourse/lib/utilities").rescueThemeError;
+
               rescue(__theme_name__, err, api);
             }
           });
@@ -555,7 +569,7 @@ HTML
   it 'includes theme_uploads in settings' do
     Theme.destroy_all
 
-    upload = Fabricate(:upload)
+    upload = UploadCreator.new(file_from_fixtures("logo.png"), "logo.png").create_for(-1)
     theme.set_field(type: :theme_upload_var, target: :common, name: "bob", upload_id: upload.id)
     theme.save!
 
@@ -657,8 +671,8 @@ HTML
     end
 
     it "can create a hash of overridden values" do
-      en_translation = ThemeField.create!(theme_id: theme.id, name: "en_US", type_id: ThemeField.types[:yaml], target_id: Theme.targets[:translations], value: <<~YAML)
-        en_US:
+      en_translation = ThemeField.create!(theme_id: theme.id, name: "en", type_id: ThemeField.types[:yaml], target_id: Theme.targets[:translations], value: <<~YAML)
+        en:
           group_of_translations:
             translation1: en test1
       YAML
@@ -668,7 +682,7 @@ HTML
       theme.update_translation("group_of_translations.translation1", "overriddentest2")
       theme.reload
       expect(theme.translation_override_hash).to eq(
-        "en_US" => {
+        "en" => {
           "group_of_translations" => {
             "translation1" => "overriddentest1"
           }
@@ -712,7 +726,7 @@ HTML
       first_common_value = Theme.lookup_field(child.id, :desktop, "header")
       first_extra_js_value = Theme.lookup_field(child.id, :extra_js, nil)
 
-      stub_const(ThemeField, :COMPILER_VERSION, "SOME_NEW_HASH") do
+      Theme.stubs(:compiler_version).returns("SOME_NEW_HASH") do
         second_common_value = Theme.lookup_field(child.id, :desktop, "header")
         second_extra_js_value = Theme.lookup_field(child.id, :extra_js, nil)
 
@@ -726,5 +740,97 @@ HTML
         expect(new_extra_js_compiler_version).to eq("SOME_NEW_HASH")
       end
     end
+
+    it 'recompiles when the hostname changes' do
+      theme.set_field(target: :settings, name: :yaml, value: "name: bob")
+      theme_field = theme.set_field(target: :common, name: :after_header, value: '<script>console.log("hello world");</script>')
+      theme.save!
+
+      expect(Theme.lookup_field(theme.id, :common, :after_header)).to include("_ws=#{Discourse.current_hostname}")
+
+      SiteSetting.force_hostname = "someotherhostname.com"
+      Theme.clear_cache!
+
+      expect(Theme.lookup_field(theme.id, :common, :after_header)).to include("_ws=someotherhostname.com")
+    end
   end
+
+  describe "extra_scss" do
+    let(:scss) { "body { background: red}" }
+    let(:second_file_scss) { "p { color: blue};" }
+    let(:child_scss) { "body { background: green}" }
+
+    let(:theme) { Fabricate(:theme).tap { |t|
+      t.set_field(target: :extra_scss, name: "my_files/magic", value: scss)
+      t.set_field(target: :extra_scss, name: "my_files/magic2", value: second_file_scss)
+      t.save!
+    }}
+
+    let(:child_theme) { Fabricate(:theme).tap { |t|
+      t.component = true
+      t.set_field(target: :extra_scss, name: "my_files/moremagic", value: child_scss)
+      t.save!
+      theme.add_relative_theme!(:child, t)
+    }}
+
+    let(:compiler) {
+      manager = Stylesheet::Manager.new(:desktop_theme, theme.id)
+      manager.compile(force: true)
+    }
+
+    it "works when importing file by path" do
+      theme.set_field(target: :common, name: :scss, value: '@import "my_files/magic";')
+      theme.save!
+
+      css, _map = compiler
+      expect(css).to include("body{background:red}")
+    end
+
+    it "works when importing multiple files" do
+      theme.set_field(target: :common, name: :scss, value: '@import "my_files/magic"; @import "my_files/magic2"')
+      theme.save!
+
+      css, _map = compiler
+      expect(css).to include("body{background:red}")
+      expect(css).to include("p{color:blue}")
+    end
+
+    it "works for child themes and includes child theme SCSS in parent theme" do
+      child_theme.set_field(target: :common, name: :scss, value: '@import "my_files/moremagic"')
+      child_theme.save!
+
+      manager = Stylesheet::Manager.new(:desktop_theme, child_theme.id)
+      css, _map = manager.compile(force: true)
+      expect(css).to include("body{background:green}")
+
+      parent_css, _parent_map = compiler
+      expect(parent_css).to include("body{background:green}")
+    end
+
+    it "does not fail if child theme has SCSS errors" do
+      child_theme.set_field(target: :common, name: :scss, value: 'p {color: $missing_var;}')
+      child_theme.save!
+
+      parent_css, _parent_map = compiler
+      expect(parent_css).to include("sourceMappingURL")
+    end
+  end
+
+  describe "scss_variables" do
+    it "is empty by default" do
+      expect(theme.scss_variables).to eq(nil)
+    end
+
+    it "includes settings and uploads when set" do
+      theme.set_field(target: :settings, name: :yaml, value: "background_color: red\nfont_size: 25px")
+      upload = UploadCreator.new(file_from_fixtures("logo.png"), "logo.png").create_for(-1)
+      theme.set_field(type: :theme_upload_var, target: :common, name: "bobby", upload_id: upload.id)
+      theme.save!
+
+      expect(theme.scss_variables).to include("$background_color: unquote(\"red\")")
+      expect(theme.scss_variables).to include("$font_size: unquote(\"25px\")")
+      expect(theme.scss_variables).to include("$bobby: ")
+    end
+  end
+
 end

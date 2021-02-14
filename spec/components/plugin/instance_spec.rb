@@ -11,8 +11,8 @@ describe Plugin::Instance do
   context "find_all" do
     it "can find plugins correctly" do
       plugins = Plugin::Instance.find_all("#{Rails.root}/spec/fixtures/plugins")
-      expect(plugins.count).to eq(3)
-      plugin = plugins[2]
+      expect(plugins.count).to eq(4)
+      plugin = plugins[3]
 
       expect(plugin.name).to eq("plugin-name")
       expect(plugin.path).to eq("#{Rails.root}/spec/fixtures/plugins/my_plugin/plugin.rb")
@@ -409,7 +409,7 @@ describe Plugin::Instance do
 
     it "enables the registered locales only on activate" do
       plugin.register_locale("foo_BAR", name: "Foo", nativeName: "Foo Bar", plural: plural)
-      plugin.register_locale("es_MX", name: "Spanish (Mexico)", nativeName: "Español (México)", fallbackLocale: "es")
+      plugin.register_locale("tup", name: "Tupi", nativeName: "Tupi", fallbackLocale: "pt_BR")
       expect(DiscoursePluginRegistry.locales.count).to eq(0)
 
       plugin.activate!
@@ -444,21 +444,21 @@ describe Plugin::Instance do
     end
 
     it "correctly registers a new locale using a fallback locale" do
-      locale = register_locale("es_MX", name: "Spanish (Mexico)", nativeName: "Español (México)", fallbackLocale: "es")
+      locale = register_locale("tup", name: "Tupi", nativeName: "Tupi", fallbackLocale: "pt_BR")
 
       expect(DiscoursePluginRegistry.locales.count).to eq(1)
-      expect(DiscoursePluginRegistry.locales).to have_key(:es_MX)
+      expect(DiscoursePluginRegistry.locales).to have_key(:tup)
 
-      expect(locale[:fallbackLocale]).to eq("es")
-      expect(locale[:message_format]).to eq(["es", "#{Rails.root}/lib/javascripts/locale/es.js"])
-      expect(locale[:moment_js]).to eq(["es", "#{Rails.root}/vendor/assets/javascripts/moment-locale/es.js"])
-      expect(locale[:moment_js_timezones]).to eq(["es", "#{Rails.root}/vendor/assets/javascripts/moment-timezone-names-locale/es.js"])
+      expect(locale[:fallbackLocale]).to eq("pt_BR")
+      expect(locale[:message_format]).to eq(["pt_BR", "#{Rails.root}/lib/javascripts/locale/pt_BR.js"])
+      expect(locale[:moment_js]).to eq(["pt-br", "#{Rails.root}/vendor/assets/javascripts/moment-locale/pt-br.js"])
+      expect(locale[:moment_js_timezones]).to eq(["pt", "#{Rails.root}/vendor/assets/javascripts/moment-timezone-names-locale/pt.js"])
       expect(locale[:plural]).to be_nil
 
-      expect(Rails.configuration.assets.precompile).to include("locales/es_MX.js")
+      expect(Rails.configuration.assets.precompile).to include("locales/tup.js")
 
-      expect(JsLocaleHelper.find_message_format_locale(["es_MX"], fallback_to_english: true)).to eq(locale[:message_format])
-      expect(JsLocaleHelper.find_moment_locale(["es_MX"])).to eq (locale[:moment_js])
+      expect(JsLocaleHelper.find_message_format_locale(["tup"], fallback_to_english: true)).to eq(locale[:message_format])
+      expect(JsLocaleHelper.find_moment_locale(["tup"])).to eq (locale[:moment_js])
     end
 
     it "correctly registers a new locale when some files exist in core" do
@@ -502,21 +502,6 @@ describe Plugin::Instance do
     end
   end
 
-  describe '#enabled_site_setting_filter' do
-    describe 'when filter is blank' do
-      it 'should return the right value' do
-        expect(Plugin::Instance.new.enabled_site_setting_filter).to eq(nil)
-      end
-    end
-
-    it 'should set the right value' do
-      instance = Plugin::Instance.new
-      instance.enabled_site_setting_filter('test')
-
-      expect(instance.enabled_site_setting_filter).to eq('test')
-    end
-  end
-
   describe '#register_reviewable_types' do
     it 'Overrides the existing Reviewable types adding new ones' do
       current_types = Reviewable.types
@@ -536,6 +521,76 @@ describe Plugin::Instance do
       Plugin::Instance.new.extend_list_method Reviewable, :types, [new_element]
 
       expect(Reviewable.types).to match_array(current_list << new_element)
+    end
+  end
+
+  describe '#register_emoji' do
+    before do
+      Plugin::CustomEmoji.clear_cache
+    end
+
+    after do
+      Plugin::CustomEmoji.clear_cache
+    end
+
+    it 'allows to register an emoji' do
+      Plugin::Instance.new.register_emoji("foo", "/foo/bar.png")
+
+      custom_emoji = Emoji.custom.first
+
+      expect(custom_emoji.name).to eq("foo")
+      expect(custom_emoji.url).to eq("/foo/bar.png")
+      expect(custom_emoji.group).to eq(Emoji::DEFAULT_GROUP)
+    end
+
+    it 'allows to register an emoji with a group' do
+      Plugin::Instance.new.register_emoji("bar", "/baz/bar.png", "baz")
+
+      custom_emoji = Emoji.custom.first
+
+      expect(custom_emoji.name).to eq("bar")
+      expect(custom_emoji.url).to eq("/baz/bar.png")
+      expect(custom_emoji.group).to eq("baz")
+    end
+  end
+
+  describe '#replace_flags' do
+    after do
+      PostActionType.replace_flag_settings(nil)
+      ReviewableScore.reload_types
+    end
+
+    let(:original_flags) { PostActionType.flag_settings }
+
+    it 'adds a new flag' do
+      highest_flag_id = ReviewableScore.types.values.max
+      flag_name = :new_flag
+
+      subject.replace_flags(settings: original_flags) do |settings, next_flag_id|
+        settings.add(
+          next_flag_id,
+          flag_name
+        )
+      end
+
+      expect(PostActionType.flag_settings.flag_types.keys).to include(flag_name)
+      expect(PostActionType.flag_settings.flag_types.values.max).to eq(highest_flag_id + 1)
+    end
+
+    it 'adds a new score type after adding a new flag' do
+      highest_flag_id = ReviewableScore.types.values.max
+      new_score_type = :new_score_type
+
+      subject.replace_flags(settings: original_flags, score_type_names: [new_score_type]) do |settings, next_flag_id|
+        settings.add(
+          next_flag_id,
+          :new_flag
+        )
+      end
+
+      expect(PostActionType.flag_settings.flag_types.values.max).to eq(highest_flag_id + 1)
+      expect(ReviewableScore.types.keys).to include(new_score_type)
+      expect(ReviewableScore.types.values.max).to eq(highest_flag_id + 2)
     end
   end
 end

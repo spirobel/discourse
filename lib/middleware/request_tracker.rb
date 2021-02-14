@@ -20,8 +20,7 @@ class Middleware::RequestTracker
   end
 
   def self.unregister_detailed_request_logger(callback)
-    @@detailed_request_loggers.delete callback
-
+    @@detailed_request_loggers.delete(callback)
     if @@detailed_request_loggers.length == 0
       @detailed_request_loggers = nil
     end
@@ -51,14 +50,6 @@ class Middleware::RequestTracker
     @app = app
   end
 
-  def self.log_request_on_site(data, host)
-    RailsMultisite::ConnectionManagement.with_hostname(host) do
-      unless Discourse.pg_readonly_mode?
-        log_request(data)
-      end
-    end
-  end
-
   def self.log_request(data)
     status = data[:status]
     track_view = data[:track_view]
@@ -86,10 +77,9 @@ class Middleware::RequestTracker
       ApplicationRequest.increment!(:http_4xx)
     elsif status >= 300
       ApplicationRequest.increment!(:http_3xx)
-    elsif status >= 200 && status < 300
+    elsif status >= 200
       ApplicationRequest.increment!(:http_2xx)
     end
-
   end
 
   def self.get_data(env, result, timing)
@@ -128,14 +118,13 @@ class Middleware::RequestTracker
     if cache = headers["X-Discourse-Cached"]
       h[:cache] = cache
     end
+
     h
   end
 
   def log_request_info(env, result, info)
-
     # we got to skip this on error ... its just logging
     data = self.class.get_data(env, result, info) rescue nil
-    host = RailsMultisite::ConnectionManagement.host(env)
 
     if data
       if result && (headers = result[1])
@@ -146,15 +135,18 @@ class Middleware::RequestTracker
         @@detailed_request_loggers.each { |logger| logger.call(env, data) }
       end
 
-      log_later(data, host)
+      log_later(data)
     end
-
   end
 
   def self.populate_request_queue_seconds!(env)
     if !env['REQUEST_QUEUE_SECONDS']
       if queue_start = env['HTTP_X_REQUEST_START']
-        queue_start = queue_start.split("t=")[1].to_f
+        queue_start = if queue_start.start_with?("t=")
+          queue_start.split("t=")[1].to_f
+        else
+          queue_start.to_f / 1000.0
+        end
         queue_time = (Time.now.to_f - queue_start)
         env['REQUEST_QUEUE_SECONDS'] = queue_time
       end
@@ -171,15 +163,20 @@ class Middleware::RequestTracker
 
     request = Rack::Request.new(env)
 
-    if rate_limit(request)
-      result = [429, {}, ["Slow down, too Many Requests from this IP Address"]]
-      return result
+    if available_in = rate_limit(request)
+      return [
+        429,
+        { "Retry-After" => available_in },
+        ["Slow down, too many requests from this IP address"]
+      ]
     end
 
     env["discourse.request_tracker"] = self
+
     MethodProfiler.start
     result = @app.call(env)
     info = MethodProfiler.stop
+
     # possibly transferred?
     if info && (headers = result[1])
       headers["X-Runtime"] = "%0.6f" % info[:total_duration]
@@ -226,7 +223,6 @@ class Middleware::RequestTracker
   end
 
   def rate_limit(request)
-
     if (
       GlobalSetting.max_reqs_per_ip_mode == "block" ||
       GlobalSetting.max_reqs_per_ip_mode == "warn" ||
@@ -246,7 +242,8 @@ class Middleware::RequestTracker
         "global_ip_limit_10_#{ip}",
         GlobalSetting.max_reqs_per_ip_per_10_seconds,
         10,
-        global: true
+        global: true,
+        aggressive: true
       )
 
       limiter60 = RateLimiter.new(
@@ -254,7 +251,8 @@ class Middleware::RequestTracker
         "global_ip_limit_60_#{ip}",
         GlobalSetting.max_reqs_per_ip_per_minute,
         60,
-        global: true
+        global: true,
+        aggressive: true
       )
 
       limiter_assets10 = RateLimiter.new(
@@ -268,38 +266,48 @@ class Middleware::RequestTracker
       request.env['DISCOURSE_RATE_LIMITERS'] = [limiter10, limiter60]
       request.env['DISCOURSE_ASSET_RATE_LIMITERS'] = [limiter_assets10]
 
-      warn = GlobalSetting.max_reqs_per_ip_mode == "warn" ||
-        GlobalSetting.max_reqs_per_ip_mode == "warn+block"
+      warn = GlobalSetting.max_reqs_per_ip_mode == "warn" || GlobalSetting.max_reqs_per_ip_mode == "warn+block"
 
       if !limiter_assets10.can_perform?
         if warn
           Discourse.warn("Global asset IP rate limit exceeded for #{ip}: 10 second rate limit", uri: request.env["REQUEST_URI"])
         end
 
-        return !(GlobalSetting.max_reqs_per_ip_mode == "warn")
+        if GlobalSetting.max_reqs_per_ip_mode != "warn"
+          return limiter_assets10.seconds_to_wait(Time.now.to_i)
+        else
+          return false
+        end
       end
 
-      type = 10
       begin
+        type = 10
         limiter10.performed!
+
         type = 60
         limiter60.performed!
+
         false
-      rescue RateLimiter::LimitExceeded
+      rescue RateLimiter::LimitExceeded => e
         if warn
           Discourse.warn("Global IP rate limit exceeded for #{ip}: #{type} second rate limit", uri: request.env["REQUEST_URI"])
-          !(GlobalSetting.max_reqs_per_ip_mode == "warn")
+          if GlobalSetting.max_reqs_per_ip_mode != "warn"
+            e.available_in
+          else
+            false
+          end
         else
-          true
+          e.available_in
         end
       end
     end
   end
 
-  def log_later(data, host)
-    Scheduler::Defer.later("Track view", _db = nil) do
-      self.class.log_request_on_site(data, host)
+  def log_later(data)
+    Scheduler::Defer.later("Track view") do
+      unless Discourse.pg_readonly_mode?
+        self.class.log_request(data)
+      end
     end
   end
-
 end

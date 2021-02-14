@@ -7,33 +7,103 @@ describe BadgeGranter do
   fab!(:badge) { Fabricate(:badge) }
   fab!(:user) { Fabricate(:user) }
 
+  before do
+    BadgeGranter.enable_queue
+  end
+
+  after do
+    BadgeGranter.disable_queue
+    BadgeGranter.clear_queue!
+  end
+
   describe 'revoke_titles' do
-    it 'can correctly revoke titles' do
-      badge = Fabricate(:badge, allow_title: true)
-      user = Fabricate(:user, title: badge.name)
-      user.reload
+    let(:user) { Fabricate(:user) }
+    let(:badge) { Fabricate(:badge, allow_title: true) }
 
-      user.user_profile.update_column(:badge_granted_title, true)
-
+    it 'revokes title when badge is not allowed as title' do
       BadgeGranter.grant(badge, user)
-      BadgeGranter.revoke_ungranted_titles!
+      user.update!(title: badge.name)
 
+      BadgeGranter.revoke_ungranted_titles!
       user.reload
       expect(user.title).to eq(badge.name)
+      expect(user.user_profile.badge_granted_title).to eq(true)
+      expect(user.user_profile.granted_title_badge_id).to eq(badge.id)
 
       badge.update_column(:allow_title, false)
       BadgeGranter.revoke_ungranted_titles!
-
       user.reload
-      expect(user.title).to eq('')
+      expect(user.title).to be_blank
+      expect(user.user_profile.badge_granted_title).to eq(false)
+      expect(user.user_profile.granted_title_badge_id).to be_nil
+    end
 
+    it 'revokes title when badge is disabled' do
+      BadgeGranter.grant(badge, user)
+      user.update!(title: badge.name)
+
+      BadgeGranter.revoke_ungranted_titles!
+      user.reload
+      expect(user.title).to eq(badge.name)
+      expect(user.user_profile.badge_granted_title).to eq(true)
+      expect(user.user_profile.granted_title_badge_id).to eq(badge.id)
+
+      badge.update_column(:enabled, false)
+      BadgeGranter.revoke_ungranted_titles!
+      user.reload
+      expect(user.title).to be_blank
+      expect(user.user_profile.badge_granted_title).to eq(false)
+      expect(user.user_profile.granted_title_badge_id).to be_nil
+    end
+
+    it 'revokes title when user badge is revoked' do
+      BadgeGranter.grant(badge, user)
+      user.update!(title: badge.name)
+
+      BadgeGranter.revoke_ungranted_titles!
+      user.reload
+      expect(user.title).to eq(badge.name)
+      expect(user.user_profile.badge_granted_title).to eq(true)
+      expect(user.user_profile.granted_title_badge_id).to eq(badge.id)
+
+      BadgeGranter.revoke(user.user_badges.first)
+      BadgeGranter.revoke_ungranted_titles!
+      user.reload
+      expect(user.title).to be_blank
+      expect(user.user_profile.badge_granted_title).to eq(false)
+      expect(user.user_profile.granted_title_badge_id).to be_nil
+    end
+
+    it 'does not revoke custom title' do
       user.title = "CEO"
-      user.save
+      user.save!
 
       BadgeGranter.revoke_ungranted_titles!
 
       user.reload
       expect(user.title).to eq("CEO")
+    end
+
+    it 'does not revoke localized title' do
+      badge = Badge.find(Badge::Regular)
+      badge_name = nil
+      BadgeGranter.grant(badge, user)
+
+      I18n.with_locale(:de) do
+        badge_name = badge.display_name
+        user.update!(title: badge_name)
+      end
+
+      user.reload
+      expect(user.title).to eq(badge_name)
+      expect(user.user_profile.badge_granted_title).to eq(true)
+      expect(user.user_profile.granted_title_badge_id).to eq(badge.id)
+
+      BadgeGranter.revoke_ungranted_titles!
+      user.reload
+      expect(user.title).to eq(badge_name)
+      expect(user.user_profile.badge_granted_title).to eq(true)
+      expect(user.user_profile.granted_title_badge_id).to eq(badge.id)
     end
   end
 
@@ -46,6 +116,11 @@ describe BadgeGranter do
 
       expect(result[:grant_count]).to eq(1)
       expect(result[:query_plan]).to be_present
+    end
+
+    it 'with badges containing trailing comments do not break generated SQL' do
+      query = Badge.find(1).query + "\n-- a comment"
+      expect(BadgeGranter.preview(query)[:errors]).to be_nil
     end
   end
 
@@ -114,27 +189,55 @@ describe BadgeGranter do
 
       expect(notification_badge_name).not_to eq(name_english)
     end
+
+    it 'with badges containing trailing comments do not break generated SQL' do
+      badge = Fabricate(:badge)
+      badge.query = Badge.find(1).query + "\n-- a comment"
+      expect { BadgeGranter.backfill(badge) }.not_to raise_error
+    end
   end
 
   describe 'grant' do
 
     it 'allows overriding of granted_at does not notify old bronze' do
+      freeze_time
       badge = Badge.create!(name: 'a badge', badge_type_id: BadgeType::Bronze)
+      user_badge = BadgeGranter.grant(badge, user, created_at: 1.year.ago)
 
-      time = 1.year.ago
-
-      user_badge = BadgeGranter.grant(badge, user, created_at: time)
-
-      expect(user_badge.granted_at).to eq(time)
+      expect(user_badge.granted_at).to eq_time(1.year.ago)
       expect(Notification.where(user_id: user.id).count).to eq(0)
     end
 
-    it "doesn't grant disabled badges" do
-      badge = Fabricate(:badge, badge_type_id: BadgeType::Bronze, enabled: false)
-      time = 1.year.ago
-
-      user_badge = BadgeGranter.grant(badge, user, created_at: time)
+    it "handles deleted badge" do
+      freeze_time
+      user_badge = BadgeGranter.grant(nil, user, created_at: 1.year.ago)
       expect(user_badge).to eq(nil)
+    end
+
+    it "doesn't grant disabled badges" do
+      freeze_time
+      badge = Fabricate(:badge, badge_type_id: BadgeType::Bronze, enabled: false)
+
+      user_badge = BadgeGranter.grant(badge, user, created_at: 1.year.ago)
+      expect(user_badge).to eq(nil)
+    end
+
+    it "doesn't grant 'getting started' badges when user skipped new user tips" do
+      freeze_time
+      user.user_option.update!(skip_new_user_tips: true)
+      badge = Fabricate(:badge, badge_grouping_id: BadgeGrouping::GettingStarted)
+
+      user_badge = BadgeGranter.grant(badge, user, created_at: 1.year.ago)
+      expect(user_badge).to eq(nil)
+    end
+
+    it "grants the New User of the Month badge when user skipped new user tips" do
+      freeze_time
+      user.user_option.update!(skip_new_user_tips: true)
+      badge = Badge.find(Badge::NewUserOfTheMonth)
+
+      user_badge = BadgeGranter.grant(badge, user, created_at: 1.year.ago)
+      expect(user_badge).to be_present
     end
 
     it 'grants multiple badges' do
@@ -147,11 +250,10 @@ describe BadgeGranter do
     end
 
     it 'sets granted_at' do
-      time = 1.day.ago
-      freeze_time time
-
+      day_ago = freeze_time 1.day.ago
       user_badge = BadgeGranter.grant(badge, user)
-      expect(user_badge.granted_at).to be_within(1.second).of(time)
+
+      expect(user_badge.granted_at).to eq_time(day_ago)
     end
 
     it 'sets granted_by if the option is present' do
@@ -176,6 +278,11 @@ describe BadgeGranter do
       BadgeGranter.grant(badge, user)
       expect(badge.reload.grant_count).to eq(1)
       expect(user.notifications.find_by(notification_type: Notification.types[:granted_badge]).data_hash["badge_id"]).to eq(badge.id)
+    end
+
+    it 'does not fail when user is missing' do
+      BadgeGranter.grant(badge, nil)
+      expect(badge.reload.grant_count).to eq(0)
     end
 
   end
@@ -228,7 +335,6 @@ describe BadgeGranter do
   describe 'revoke_all' do
     it 'deletes every user_badge record associated with that badge' do
       described_class.grant(badge, user)
-
       described_class.revoke_all(badge)
 
       expect(UserBadge.exists?(badge: badge, user: user)).to eq(false)
@@ -248,7 +354,7 @@ describe BadgeGranter do
 
     it 'removes custom badge titles' do
       custom_badge_title = 'this is a badge title'
-      TranslationOverride.create!(translation_key: badge.translation_key, value: custom_badge_title, locale: 'en_US')
+      TranslationOverride.create!(translation_key: badge.translation_key, value: custom_badge_title, locale: 'en')
       described_class.grant(badge, user)
       user.update!(title: custom_badge_title)
 
@@ -261,10 +367,6 @@ describe BadgeGranter do
   context "update_badges" do
     fab!(:user) { Fabricate(:user) }
     fab!(:liker) { Fabricate(:user) }
-
-    before do
-      BadgeGranter.clear_queue!
-    end
 
     it "grants autobiographer" do
       user.user_profile.bio_raw = "THIS IS MY bio it a long bio I like my bio"

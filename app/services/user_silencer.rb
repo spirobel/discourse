@@ -36,7 +36,6 @@ class UserSilencer
         ).format
 
         context = "#{message_type}: '#{post.topic&.title rescue ''}' #{@opts[:reason]}"
-        SystemMessage.create(@user, message_type)
 
         if @by_user
           log_params = { context: context, details: details }
@@ -48,6 +47,7 @@ class UserSilencer
           )
         end
 
+        silence_message_params = {}
         DiscourseEvent.trigger(
           :user_silenced,
           user: @user,
@@ -57,8 +57,11 @@ class UserSilencer
           user_history: @user_history,
           post_id: @opts[:post_id],
           silenced_till: @user.silenced_till,
-          silenced_at: DateTime.now
+          silenced_at: DateTime.now,
+          silence_message_params: silence_message_params
         )
+
+        SystemMessage.create(@user, message_type, silence_message_params)
         true
       end
     else
@@ -77,7 +80,7 @@ class UserSilencer
   def unsilence
     @user.silenced_till = nil
     if @user.save
-      DiscourseEvent.trigger(:user_unsilenced, user: @user)
+      DiscourseEvent.trigger(:user_unsilenced, user: @user, by_user: @by_user)
       SystemMessage.create(@user, :unsilenced)
       StaffActionLogger.new(@by_user).log_unsilence_user(@user) if @by_user
     end

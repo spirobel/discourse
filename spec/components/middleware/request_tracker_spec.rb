@@ -15,6 +15,15 @@ describe Middleware::RequestTracker do
     }.merge(opts)
   end
 
+  before do
+    ApplicationRequest.enable
+  end
+
+  after do
+    ApplicationRequest.disable
+    ApplicationRequest.clear_cache!
+  end
+
   context "full request" do
     before do
       @orig = WebCrawlerRequest.autoflush
@@ -79,10 +88,18 @@ describe Middleware::RequestTracker do
 
       Middleware::RequestTracker.log_request(data)
 
+      # /srv/status is never a tracked view because content-type is text/plain
+      data = Middleware::RequestTracker.get_data(env(
+        "HTTP_USER_AGENT" => "kube-probe/1.18",
+        "REQUEST_URI" => "/srv/status?shutdown_ok=1",
+      ), ["200", { "Content-Type" => 'text/plain' }], 0.1)
+
+      Middleware::RequestTracker.log_request(data)
+
       ApplicationRequest.write_cache!
 
-      expect(ApplicationRequest.http_total.first.count).to eq(3)
-      expect(ApplicationRequest.http_2xx.first.count).to eq(3)
+      expect(ApplicationRequest.http_total.first.count).to eq(4)
+      expect(ApplicationRequest.http_2xx.first.count).to eq(4)
 
       expect(ApplicationRequest.page_view_anon.first.count).to eq(2)
       expect(ApplicationRequest.page_view_crawler.first.count).to eq(1)
@@ -220,10 +237,11 @@ describe Middleware::RequestTracker do
       global_setting :max_reqs_per_ip_mode, 'warn+block'
 
       status, _ = middleware.call(env)
-      status, _ = middleware.call(env)
+      status, headers = middleware.call(env)
 
       expect(Rails.logger.warnings).to eq(1)
       expect(status).to eq(429)
+      expect(headers["Retry-After"]).to eq(10)
     end
 
     it "does warn if rate limiter is enabled" do
@@ -250,13 +268,15 @@ describe Middleware::RequestTracker do
       expect(status).to eq(200)
       status, _ = middleware.call(env1)
       expect(status).to eq(200)
-      status, _ = middleware.call(env1)
+      status, headers = middleware.call(env1)
       expect(status).to eq(429)
+      expect(headers["Retry-After"]).to eq(10)
 
       env2 = env("REMOTE_ADDR" => "1.1.1.1")
 
-      status, _ = middleware.call(env2)
+      status, headers = middleware.call(env2)
       expect(status).to eq(429)
+      expect(headers["Retry-After"]).to eq(10)
     end
 
     it "does block if rate limiter is enabled" do
@@ -269,8 +289,9 @@ describe Middleware::RequestTracker do
       status, _ = middleware.call(env1)
       expect(status).to eq(200)
 
-      status, _ = middleware.call(env1)
+      status, headers = middleware.call(env1)
       expect(status).to eq(429)
+      expect(headers["Retry-After"]).to eq(10)
 
       status, _ = middleware.call(env2)
       expect(status).to eq(200)
@@ -326,7 +347,7 @@ describe Middleware::RequestTracker do
       tracker.call(env("REQUEST_URI" => uri, "ANON_CACHE_DURATION" => 60))
       expect(@data[:cache]).to eq("true")
 
-      # not whitelisted
+      # not allowlisted
       request_params.delete("a")
 
       expect(@env["action_dispatch.request.parameters"]).to eq(request_params)

@@ -1,0 +1,20 @@
+{{#unless isHidden}}
+  {{input
+    tabindex=-1
+    class="filter-input"
+    placeholder=placeholder
+    autocomplete="off"
+    autocorrect="off"
+    autocapitalize="off"
+    spellcheck=false
+    value=(readonly selectKit.filter)
+    input=(action "onInput")
+    paste=(action "onPaste")
+    keyDown=(action "onKeydown")
+    keyUp=(action "onKeyup")
+  }}
+
+  {{#if selectKit.options.filterIcon}}
+    {{d-icon selectKit.options.filterIcon class="filter-icon"}}
+  {{/if}}
+{{/unless}}

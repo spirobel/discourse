@@ -39,7 +39,7 @@ class Wizard
 
       @wizard.append_step('forum-title') do |step|
         step.add_field(id: 'title', type: 'text', required: true, value: SiteSetting.title)
-        step.add_field(id: 'site_description', type: 'text', required: true, value: SiteSetting.site_description)
+        step.add_field(id: 'site_description', type: 'text', required: false, value: SiteSetting.site_description)
         step.add_field(id: 'short_site_description', type: 'text', required: false, value: SiteSetting.short_site_description)
 
         step.on_update do |updater|
@@ -58,8 +58,7 @@ class Wizard
           step.disabled = true
           step.description_vars = { topic_title: I18n.t("discourse_welcome_topic.title") }
         else
-          step.add_field(id: 'welcome', type: 'textarea', required: true, value: introduction.get_summary)
-
+          step.add_field(id: 'welcome', type: 'textarea', required: false, value: introduction.get_summary)
           step.on_update do |updater|
             value = updater.fields[:welcome].strip
 
@@ -155,7 +154,7 @@ class Wizard
           id: 'theme_previews',
           type: 'component',
           required: !default_theme_override,
-          value: scheme_id
+          value: scheme_id || ColorScheme::LIGHT_THEME_ID
         )
 
         # fix for the case when base_scheme is nil
@@ -182,26 +181,42 @@ class Wizard
 
           name = I18n.t("color_schemes.#{scheme_name.downcase.gsub(' ', '_')}_theme_name")
 
-          theme = nil
           scheme = ColorScheme.find_by(base_scheme_id: scheme_name, via_wizard: true)
           scheme ||= ColorScheme.create_from_base(name: name, via_wizard: true, base_scheme_id: scheme_name)
-          themes = Theme.where(color_scheme_id: scheme.id).order(:id).to_a
-          theme = themes.find(&:default?)
-          theme ||= themes.first
 
-          theme ||= Theme.create!(
-            name: name,
-            user_id: @wizard.user.id,
-            color_scheme_id: scheme.id
-          )
+          if default_theme
+            default_theme.color_scheme_id = scheme.id
+            default_theme.save!
+          else
+            theme = Theme.create!(
+              name: name,
+              user_id: @wizard.user.id,
+              color_scheme_id: scheme.id
+            )
 
-          theme.set_default!
+            theme.set_default!
+          end
         end
       end
 
-      @wizard.append_step('themes-further-reading') do |step|
-        step.banner = "further-reading.png"
-        step.add_field(id: 'popular-themes', type: 'component')
+      @wizard.append_step('fonts') do |step|
+        body_font = step.add_field(id: 'body_font', type: 'dropdown', value: SiteSetting.base_font)
+        heading_font = step.add_field(id: 'heading_font', type: 'dropdown', value: SiteSetting.heading_font)
+
+        DiscourseFonts.fonts.each do |font|
+          body_font.add_choice(font[:key], label: font[:name])
+          heading_font.add_choice(font[:key], label: font[:name])
+        end
+
+        step.add_field(
+          id: 'font_preview',
+          type: 'component'
+        )
+
+        step.on_update do |updater|
+          updater.update_setting(:base_font, updater.fields[:body_font])
+          updater.update_setting(:heading_font, updater.fields[:heading_font])
+        end
       end
 
       @wizard.append_step('logos') do |step|
@@ -260,7 +275,7 @@ class Wizard
 
         EmojiSetSiteSetting.values.each do |set|
           imgs = emoji.map do |e|
-            "<img src='#{Discourse.base_uri}/images/emoji/#{set[:value]}/#{e}.png'>"
+            "<img src='#{Discourse.base_path}/images/emoji/#{set[:value]}/#{e}.png'>"
           end
 
           sets.add_choice(set[:value],
